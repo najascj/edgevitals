@@ -1,0 +1,180 @@
+{
+  "_comment": [
+    "Process monitor: samples resource use per process, flags threshold crossings, sends critical ones to EdgeSentinel.",
+    "Roles below are built from the exe names actually observed on the GFF rig's discovery log on 10 Sep 2026."
+  ],
+
+  "sampling": {
+    "interval_ms": 10000,
+    "enumerate_every_ticks": 6
+  },
+
+  "output": {
+    "dir": "logs",
+    "prefix": "telemetry",
+    "retention_days": 180,
+    "archive_after_days": 7,
+    "archive_max_mb": 64,
+    "txn_active_pct": 5,
+    "bg_limit_pct": 5,
+    "disk_floor_mb": 500,
+    "flush_every_tick": true
+  },
+
+  "discovery": {
+    "enabled": true,
+    "file": "unknown-processes.csv",
+    "_comment": [
+      "Names here are suppressed from the discovery log; tracked exes are already excluded.",
+      "Anything left below is genuine workstation noise on this rig and does not earn 13 columns."
+    ],
+    "system_allowlist": [
+      "system", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
+      "lsass.exe", "winlogon.exe", "svchost.exe", "explorer.exe", "dwm.exe",
+      "fontdrvhost.exe", "spoolsv.exe", "taskhostw.exe", "sihost.exe",
+      "ctfmon.exe", "runtimebroker.exe", "conhost.exe", "registry",
+      "memory compression", "dllhost.exe", "searchindexer.exe",
+      "audiodg.exe", "wmiprvse.exe", "lsaiso.exe", "securityhealthsystray.exe", "securityhealthservice.exe",
+      "defrag.exe", "fodhelper.exe", "dismhost.exe",
+      "applicationframehost.exe", "shellexperiencehost.exe",
+      "startmenuexperiencehost.exe", "textinputhost.exe", "useroobebroker.exe",
+      "backgroundtaskhost.exe", "aggregatorhost.exe", "wmiregistrationservice.exe",
+      "wudfhost.exe", "msdtc.exe", "sppsvc.exe", "provtool.exe", "upfc.exe",
+      "cleanmgr.exe", "compattelrunner.exe", "jusched.exe", "jhi_service.exe",
+      "igfxcuiservice.exe", "igfxem.exe", "intelcphdcpsvc.exe",
+      "intelcphecisvc.exe", "oneapp.igcc.winservice.exe", "tabtip.exe",
+      "microsoftedgeupdate.exe", "smartscreen.exe", "systemsettings.exe",
+      "systemsettingsbroker.exe", "searchapp.exe", "notepad.exe", "cmd.exe"
+    ]
+  },
+
+  "ipc": {
+    "enabled": true,
+    "pipe": "\\\\.\\pipe\\edgevitals",
+    "client_sid": "AU",
+    "max_clients": 4,
+    "allow_snapshot": false,
+    "_comment": [
+      "Columns clients may push. Declared here because the schema freezes before the first row.",
+      "client_sid MUST be narrowed from AU to EdgeTerminal's account before production -- see SECURITY_REVIEW.md."
+    ],
+    "extra_columns": [
+      { "name": "state",              "text": true },
+      { "name": "persona",            "text": true },
+      { "name": "theme",              "text": true },
+      { "name": "frame_p50_ms",       "precision": 2 },
+      { "name": "frame_p95_ms",       "precision": 2 },
+      { "name": "frame_p99_ms",       "precision": 2 },
+      { "name": "frame_max_ms",       "precision": 2 },
+      { "name": "frames_total",       "precision": 0 },
+      { "name": "frames_over_33ms",   "precision": 0 },
+      { "name": "tts_synth_ms",       "precision": 1 },
+      { "name": "tts_chars",          "precision": 0 },
+      { "name": "rhubarb_ms",         "precision": 1 },
+      { "name": "asr_partial_ms",     "precision": 1 },
+      { "name": "audio_underruns",    "precision": 0 },
+      { "name": "cam_face_fps",       "precision": 1 },
+      { "name": "cam_slot_fps",       "precision": 1 },
+      { "name": "cam_lobby_fps",      "precision": 1 },
+      { "name": "cam_drops",          "precision": 0 },
+      { "name": "vision_proc_p95_ms", "precision": 2 },
+      { "name": "feed_mbs",           "precision": 2 },
+      { "name": "feed_queue_depth",   "precision": 0 }
+    ]
+  },
+
+  "processes": [
+    { "role": "ui",       "label": "EdgeTerminal", "tier": "transaction", "group": "bosach",
+      "_note": "10 Sep: 673 MB p50, peak 1430, +548 handles over 7 h, three restarts.",
+      "exe": ["EdgeTerminalDemo.exe", "EdgeTerminal.exe"],
+      "ram_budget_mb": 260,  "cpu_budget_pct": 20, "gui": true },
+
+    { "role": "vision",   "label": "EdgeSignal-Vision", "tier": "background", "group": "bosach",
+      "_note": "ESV runs as plain python.exe on this rig -- see the warning in the notes.",
+      "exe": ["edgesignal-vision.exe", "EdgeSignalVision.exe", "python.exe", "python3.11.exe", "pythonw.exe"],
+      "ram_budget_mb": 220,  "cpu_budget_pct": 60 },
+
+    { "role": "vosk",     "label": "Vosk ASR (in-process today)", "tier": "interactive", "group": "bosach",
+      "_note": "Never binds -- ASR runs inside EdgeTerminal, so its cost sits inside ui_.",
+      "exe": ["vosk-server.exe"],
+      "ram_budget_mb": 130,  "cpu_budget_pct": 30 },
+
+    { "role": "piper",    "label": "Piper TTS", "tier": "interactive", "group": "bosach",
+      "_note": "90-200% of one core for 1-2 s per utterance by design.",
+      "exe": ["piper.exe"],
+      "ram_budget_mb": 150,  "cpu_budget_pct": 100 },
+
+    { "role": "rhubarb",  "label": "Rhubarb lip-sync", "tier": "interactive", "group": "bosach",
+      "_note": "Short-lived per utterance; sampled only when a 10 s tick lands on it.",
+      "exe": ["rhubarb.exe"],
+      "ram_budget_mb": 60,   "cpu_budget_pct": 100 },
+
+    { "role": "content",  "label": "EdgeSignal-Content", "tier": "background", "group": "bosach",
+      "_note": "Idle most of the time; spikes during patch or content delivery.",
+      "exe": ["edgesignal-content.exe"],
+      "ram_budget_mb": 60,   "cpu_budget_pct": 20 },
+
+    { "role": "campaign", "label": "EdgeCampaign", "tier": "background", "group": "bosach",
+      "_note": "Unmeasured.",
+      "exe": ["edgecampaign.exe"],
+      "ram_budget_mb": 50,   "cpu_budget_pct": 10 },
+
+    { "role": "monitor",  "label": "EdgeMonitor / APEX-Edge", "tier": "background", "group": "bosach",
+      "_note": "Unmeasured.",
+      "exe": ["edgemonitor.exe", "apex-edge.exe"],
+      "ram_budget_mb": 260,  "cpu_budget_pct": 60 },
+
+    { "role": "nats",     "label": "NATS leaf node", "tier": "transaction", "group": "bosach",
+      "_note": "Not seen on the GFF rig on 10 Sep -- expect this role to stay empty.",
+      "exe": ["nats-server.exe"],
+      "ram_budget_mb": 45,   "cpu_budget_pct": 5 },
+
+    { "role": "bastion",  "label": "EdgeBastion", "tier": "transaction", "group": "bosach",
+      "_note": "Not yet shipped; 40 MB is a design target, not a measurement.",
+      "exe": ["edgebastion.exe"],
+      "ram_budget_mb": 40,   "cpu_budget_pct": 10 },
+
+    { "role": "vitals",   "label": "EdgeVitals (self)", "tier": "interactive", "group": "bosach", "self": true,
+      "_note": "self:true binds by PID -- a rename must never leave the agent blind to itself.",
+      "exe": ["edgevitals.exe"],
+      "ram_budget_mb": 15,   "cpu_budget_pct": 1 },
+
+    { "role": "broker",   "label": "EdgeXfsBroker", "tier": "transaction", "group": "bosach",
+      "_note": "Untracked until 12 Sep. Sits on the dispense path and writes the evidence journal.",
+      "exe": ["edgexfsbroker.exe"],
+      "ram_budget_mb": 80,   "cpu_budget_pct": 20 },
+
+    { "role": "xfs",      "label": "Vendor XFS / device runtime (Perto)", "tier": "transaction", "group": "environment",
+      "_note": "Six managers under C:\\Perto\\Managers; row is the SUM, xfs_pid shows only the first.",
+      "exe": [
+        "pertocdmspimanager.exe",
+        "pertoidcspimanager.exe",
+        "pertopinspimanager.exe",
+        "pertoptrspimanager.exe",
+        "pertosiuspimanager.exe",
+        "pertovdmspimanager.exe"
+      ],
+      "ram_budget_mb": 0,  "cpu_budget_pct": 0 },
+
+    { "role": "defender", "label": "Microsoft Defender", "tier": "background", "group": "environment",
+      "_note": "Live on the GFF rig; mpcmdrun is the on-demand scanner and spikes hard.",
+      "exe": ["msmpeng.exe", "mpdefendercoreservice.exe", "nissrv.exe", "mpcmdrun.exe"],
+      "ram_budget_mb": 0,  "cpu_budget_pct": 0 },
+
+    { "role": "winupd",   "label": "Windows servicing", "tier": "background", "group": "environment",
+      "_note": "Multi-minute CPU and disk transients that otherwise look like an app fault.",
+      "exe": ["trustedinstaller.exe", "tiworker.exe", "mousocoreworker.exe",
+              "wuauclt.exe", "usoclient.exe"],
+      "ram_budget_mb": 0,  "cpu_budget_pct": 0 },
+
+    { "role": "browser",  "label": "Edge (demo signage)", "tier": "background", "group": "environment",
+      "_note": "msedge was running on 10 Sep; multi-process, so the row is the sum of all tabs.",
+      "exe": ["msedge.exe"],
+      "ram_budget_mb": 0,  "cpu_budget_pct": 0 },
+
+    { "role": "appctl",   "label": "Application control (Solidcore / Trellix)", "tier": "background", "group": "environment",
+      "_note": "Not present on this rig -- remove the role if it never appears.",
+      "exe": ["scsrvc.exe", "sadmin.exe", "scanalyzer.exe", "sc_client.exe"],
+      "ram_budget_mb": 0,  "cpu_budget_pct": 0 }
+  ]
+}

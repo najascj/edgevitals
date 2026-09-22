@@ -1,0 +1,2869 @@
+Agent.cpp
+#include "edgevitals/Agent.h"
+
+#include <algorithm>
+#include <fstream>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <cstdio>
+
+namespace ev {
+
+Agent::Agent(Config cfg, ILogger& log) : cfg_(std::move(cfg)), log_(log) {}
+
+Agent::~Agent() {
+    stop();
+    if (wakeEvent_) {
+        CloseHandle(static_cast<HANDLE>(wakeEvent_));
+        wakeEvent_ = nullptr;
+    }
+}
+
+void Agent::buildSchema() {
+    col_.ts = schema_.add("ts", 0);
+    col_.seq = schema_.add("seq", 0);
+    col_.runId = schema_.add("run_id", 0);
+    col_.agentVer = schema_.add("agent_version", 0);
+    col_.cfgHash = schema_.add("config_hash", 0);
+    // Only present when --note was given. An empty column costs one comma per
+    // row; a run nobody can identify costs an afternoon.
+    if (!cfg_.runNote.empty()) col_.runNote = schema_.add("run_note", 0);
+    col_.uptime = schema_.add("uptime_s", 0);
+    // Actual interval minus nominal. Rates are computed from the real elapsed
+    // time so they stay correct, but a loop that slips is a loop competing for
+    // CPU, and nothing on the row said so. Empty on the first tick of a run.
+    col_.tickSkew = schema_.add("tick_skew_ms", 1);
+    col_.sampleCost = schema_.add("sample_cost_ms", 3);
+    // Split from sample_cost_ms. Conflated, a 0.43 ms distribution and a 25 ms
+    // one averaged into a single number that could not be checked against
+    // either budget -- and whose p95 depended on where the enumeration tick
+    // happened to land.
+    col_.enumCost = schema_.add("enum_cost_ms", 3);
+
+    // Extra columns come BEFORE the per-process block so state, persona and
+    // theme sit near the front of the file where a human scrolling the CSV
+    // will actually see them.
+    for (const auto& e : cfg_.extraColumns) schema_.add(e.name, e.precision);
+
+    for (const auto& tp : cfg_.tracked) {
+        RoleCols rc{};
+        const std::string p = tp.role + "_";
+        rc.pid = schema_.add(p + "pid", 0);
+        rc.cpu = schema_.add(p + "cpu_pct", 2);
+        rc.cpuKernel = schema_.add(p + "cpu_kernel_pct", 2);
+        rc.rss = schema_.add(p + "rss_mb", 1);
+        rc.priv = schema_.add(p + "private_mb", 1);
+        rc.peak = schema_.add(p + "peak_rss_mb", 1);
+        rc.faults = schema_.add(p + "pagefault_delta", 0);
+        rc.handles = schema_.add(p + "handles", 0);
+        rc.threads = schema_.add(p + "threads", 0);
+        if (tp.gui) {
+            rc.gdi = schema_.add(p + "gdi_objects", 0);
+            rc.user = schema_.add(p + "user_objects", 0);
+        }
+        rc.ioRead = schema_.add(p + "io_read_mbs", 3);
+        rc.ioWrite = schema_.add(p + "io_write_mbs", 3);
+        rc.ioReadOps = schema_.add(p + "io_read_ops", 1);
+        rc.ioWriteOps = schema_.add(p + "io_write_ops", 1);
+        rc.cpuSeconds = schema_.add(p + "cpu_seconds", 1);
+        rc.priority = schema_.add(p + "priority", 0);
+        roleCols_.emplace_back(tp.role, rc);
+    }
+
+    // Group rollups sit after the per-role block and before the system-wide
+    // columns: they are an aggregate of what precedes them, and a reader
+    // scrolling right meets the parts before the total.
+    {
+        std::vector<std::string> seen;
+        for (const auto& tp : cfg_.tracked) {
+            if (tp.group.empty()) continue;
+            if (std::find(seen.begin(), seen.end(), tp.group) != seen.end()) continue;
+            seen.push_back(tp.group);
+            GroupCols gc{};
+            const std::string p = tp.group + "_total_";
+            gc.priv = schema_.add(p + "private_mb", 1);
+            gc.cpu = schema_.add(p + "cpu_pct", 2);
+            gc.cpuKernel = schema_.add(p + "cpu_kernel_pct", 2);
+            gc.handles = schema_.add(p + "handles", 0);
+            gc.threads = schema_.add(p + "threads", 0);
+            // How many roles in the group were actually live this tick. A
+            // total of 300 MB from two roles and from nine are different
+            // facts, and without this the reader cannot tell them apart.
+            gc.cpuSeconds = schema_.add(p + "cpu_seconds", 1);
+            gc.live = schema_.add(p + "live_roles", 0);
+            groupCols_.emplace_back(tp.group, gc);
+        }
+    }
+
+    // Contention accounting sits with the system-wide columns because it is a
+    // statement about the machine, not about any one role.
+    col_.txnCpu = schema_.add("txn_cpu_pct", 2);
+    col_.bgCpu = schema_.add("bg_cpu_pct", 2);
+    col_.contention = schema_.add("contention_ticks", 0);
+
+    col_.sysCpu = schema_.add("sys_cpu_pct", 2);
+    col_.sysAvail = schema_.add("sys_avail_mb", 1);
+    // Without the denominator on the row, every percentage computed later is
+    // uninterpretable: 1840 MB available is a 4 GB terminal in trouble or a
+    // 32 GB workstation idling, and a CSV read in six months cannot tell.
+    col_.sysTotal = schema_.add("sys_total_mb", 1);
+    col_.sysCommit = schema_.add("sys_commit_pct", 2);
+    col_.diskFree = schema_.add("disk_free_mb", 0);
+    col_.cores = schema_.add("cores", 0);
+    col_.unknownNew = schema_.add("unknown_new", 0);
+    col_.budgetBreaches = schema_.add("budget_breaches", 0);
+
+    // Frozen before the first row. A column appearing mid-file would
+    // desynchronise every row already on disk today.
+    schema_.freeze();
+}
+
+bool Agent::start() {
+    // Generated before the schema so the first row already carries it. Derived
+    // from the start time and the process id: unique enough to group by, short
+    // enough not to bloat every row, and sortable by start order.
+    {
+        const std::uint64_t t = monotonicNs() ^ (static_cast<std::uint64_t>(GetCurrentProcessId()) << 32);
+        char buf[20];
+        std::snprintf(buf, sizeof(buf), "%08llx",
+                      static_cast<unsigned long long>((t >> 12) & 0xFFFFFFFFull));
+        runId_ = buf;
+    }
+
+    // Config hash. FNV-1a over the raw file: two runs with different hashes
+    // were produced under different rules, and comparing their numbers without
+    // knowing that is how a "regression" turns out to be a config change.
+    {
+        std::uint32_t h = 2166136261u;
+        std::ifstream cf(cfg_.sourcePath, std::ios::binary);
+        char ch;
+        while (cf.get(ch)) { h ^= static_cast<unsigned char>(ch); h *= 16777619u; }
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%08x", h);
+        cfgHash_ = buf;
+    }
+
+    buildSchema();
+
+    proc_.reset(new ProcessSampler(cfg_));
+    sys_.reset(new SystemSampler());
+
+    CsvSink::Options o;
+    o.dir = cfg_.logDir;
+    o.prefix = cfg_.filePrefix;
+    o.retentionDays = cfg_.retentionDays;
+    o.archiveAfterDays = cfg_.archiveAfterDays;
+    o.archiveMaxMb = cfg_.archiveMaxMb;
+    o.diskFloorMb = cfg_.diskFloorMb;
+    o.flushEveryTick = cfg_.flushEveryTick;
+    sink_.reset(new CsvSink(o, schema_, std::make_shared<Win32DiskSpace>()));
+
+    if (cfg_.discoverUnknown) {
+        std::vector<std::string> trackedExe;
+        for (const auto& tp : cfg_.tracked)
+            for (const auto& e : tp.exe) trackedExe.push_back(e);
+        std::string dpath = cfg_.discoveryFile;
+        if (dpath.find('/') == std::string::npos && dpath.find('\\') == std::string::npos)
+            dpath = cfg_.logDir + "/" + dpath;
+        discovery_.reset(new DiscoveryLog(dpath, cfg_.systemAllowlist, trackedExe));
+        discovery_->loadExisting();
+        log_.info("discovery: " + std::to_string(discovery_->knownCount()) +
+                  " binaries already recorded");
+    }
+
+    if (cfg_.ipcEnabled) {
+        std::vector<std::string> keys;
+        for (const auto& e : cfg_.extraColumns) keys.push_back(e.name);
+        ipc_.reset(new IpcServer(cfg_.pipeName, keys));
+        // Set before start(): the DACL is built inside the listener thread,
+        // so anything applied afterwards would arrive too late.
+        ipc_->setSecurity(cfg_.ipcClientSid, cfg_.ipcMaxClients, cfg_.ipcAllowSnapshot);
+        if (!ipc_->start())
+            log_.warn("IPC did not start (" + ipc_->lastError() +
+                      ") -- sampling continues without client metrics");
+        else
+            log_.info("IPC listening on " + cfg_.pipeName);
+    }
+
+    wakeEvent_ = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    startNs_ = monotonicNs();
+    lastTickNs_ = 0;
+    running_.store(true);
+
+    log_.info("EdgeVitals started: interval " + std::to_string(cfg_.intervalMs) + " ms, " +
+              std::to_string(cfg_.tracked.size()) + " tracked roles, " +
+              std::to_string(schema_.size()) + " columns, log dir " + cfg_.logDir);
+    return true;
+}
+
+void Agent::run() {
+    while (running_.load()) {
+        const std::uint64_t t0 = monotonicNs();
+        doTick();
+        const std::uint64_t spent = monotonicNs() - t0;
+
+        // Subtract the work from the sleep so ticks stay on a cadence rather
+        // than drifting later by the sampling cost every single time.
+        const std::uint64_t budgetNs = static_cast<std::uint64_t>(cfg_.intervalMs) * 1000000ull;
+        DWORD waitMs = 0;
+        if (spent < budgetNs) waitMs = static_cast<DWORD>((budgetNs - spent) / 1000000ull);
+
+        if (WaitForSingleObject(static_cast<HANDLE>(wakeEvent_), waitMs) == WAIT_OBJECT_0) break;
+    }
+    log_.info("EdgeVitals stopped after " + std::to_string(tick_) + " ticks");
+}
+
+void Agent::stop() {
+    if (!running_.exchange(false)) return;
+    if (wakeEvent_) SetEvent(static_cast<HANDLE>(wakeEvent_));
+    if (ipc_) ipc_->stop();
+}
+
+void Agent::doTick() {
+    const std::uint64_t t0 = monotonicNs();
+    std::string iso;
+    Date today;
+    nowLocal(iso, today);
+
+    // Monotonic, not wall clock: an NTP step must not make one tick report an
+    // impossible CPU percentage.
+    const std::uint64_t now = monotonicNs();
+    const std::uint64_t elapsedNs = lastTickNs_ ? (now - lastTickNs_) : 0;
+    lastTickNs_ = now;
+
+    // Enumeration is the expensive call, so it runs every Nth tick. Its cost
+    // is timed separately and reported in its own column -- averaging it into
+    // sample_cost_ms made both numbers uncheckable.
+    int newUnknown = 0;
+    bool enumerated = false;
+    if (tick_ % cfg_.enumerateEveryTicks == 0) {
+        const std::uint64_t e0 = monotonicNs();
+        const auto all = proc_->enumerate();
+        proc_->bindRoles(all);
+        if (discovery_) newUnknown = discovery_->record(all, iso);
+        lastEnumCostMs_ = static_cast<double>(monotonicNs() - e0) / 1e6;
+        enumerated = true;
+    }
+
+    Row row(schema_);
+    row.setText(col_.ts, iso);
+    row.setNumber(col_.seq, static_cast<double>(tick_));
+    row.setText(col_.runId, runId_);
+    row.setText(col_.agentVer, kAgentVersion);
+    row.setText(col_.cfgHash, cfgHash_);
+    if (col_.runNote != Schema::npos) row.setText(col_.runNote, cfg_.runNote);
+    row.setNumber(col_.uptime, static_cast<double>((now - startNs_) / 1000000000ull));
+    if (elapsedNs > 0) {
+        const double skewMs = (static_cast<double>(elapsedNs) / 1.0e6) -
+                              static_cast<double>(cfg_.intervalMs);
+        row.setNumber(col_.tickSkew, skewMs);
+    }
+
+    // Client-pushed columns. Drain-on-read: a client that stops pushing leaves
+    // its cells empty rather than repeating a stale value forever.
+    if (ipc_) {
+        for (const auto& kv : ipc_->drain()) {
+            if (kv.second.isText)
+                row.setText(kv.first, kv.second.txt);
+            else
+                row.setNumber(kv.first, kv.second.num);
+        }
+    }
+
+    int breaches = 0;
+    // Accumulated per group as roles are written. Kept parallel to
+    // groupCols_ so no lookup by name is needed in the hot path.
+    struct GroupAcc { double priv = 0, cpu = 0, cpuKernel = 0, handles = 0, threads = 0, cpuSeconds = 0; int live = 0; };
+    std::vector<GroupAcc> gacc(groupCols_.size());
+    // Tier totals for this tick. Separate from groups on purpose: a role can
+    // be BOSACH and background at the same time, and the two are unrelated
+    // questions.
+    double txnCpu = 0.0, bgCpu = 0.0;
+    bool anyTiered = false;
+
+    if (elapsedNs > 0) {
+        proc_->setTick(tick_);
+        auto samples = proc_->sampleAll(elapsedNs);
+        for (const auto& rc : roleCols_) {
+            auto it = samples.find(rc.first);
+            // Absent or not running leaves every cell EMPTY. "Not licensed"
+            // and "idle" must never both render as 0.
+            if (it == samples.end() || !it->second.valid) continue;
+            const ProcSample& s = it->second;
+            const RoleCols& c = rc.second;
+            row.setNumber(c.pid, static_cast<double>(s.pid));
+            row.setNumber(c.cpu, s.cpuPct);
+            row.setNumber(c.cpuKernel, s.cpuKernelPct);
+            row.setNumber(c.rss, s.rssMb);
+            row.setNumber(c.priv, s.privateMb);
+            row.setNumber(c.peak, s.peakRssMb);
+            row.setNumber(c.faults, s.pageFaultDelta);
+            row.setNumber(c.handles, s.handles);
+            row.setNumber(c.threads, s.threads);
+            if (c.gdi != Schema::npos) {
+                row.setNumber(c.gdi, s.gdiObjects);
+                row.setNumber(c.user, s.userObjects);
+            }
+            row.setNumber(c.ioRead, s.ioReadMbs);
+            row.setNumber(c.ioWrite, s.ioWriteMbs);
+            row.setNumber(c.ioReadOps, s.ioReadOps);
+            row.setNumber(c.ioWriteOps, s.ioWriteOps);
+            row.setNumber(c.cpuSeconds, s.cpuSeconds);
+            // Empty rather than a placeholder when GetPriorityClass failed:
+            // "could not read" and "normal" must not look the same.
+            if (s.priority && s.priority[0]) row.setText(c.priority, s.priority);
+
+            for (const auto& tp : cfg_.tracked) {
+                if (tp.role != rc.first) continue;
+                if (tp.ramBudgetMb > 0 && s.privateMb > tp.ramBudgetMb) ++breaches;
+                if (tp.cpuBudgetPct > 0 && s.cpuPct > tp.cpuBudgetPct) ++breaches;
+                if (tp.tier == "transaction") { txnCpu += s.cpuPct; anyTiered = true; }
+                else if (tp.tier == "background") { bgCpu += s.cpuPct; anyTiered = true; }
+                if (!tp.group.empty()) {
+                    for (size_t gi = 0; gi < groupCols_.size(); ++gi) {
+                        if (groupCols_[gi].first != tp.group) continue;
+                        gacc[gi].priv += s.privateMb;
+                        gacc[gi].cpu += s.cpuPct;
+                        gacc[gi].cpuKernel += s.cpuKernelPct;
+                        gacc[gi].handles += s.handles;
+                        gacc[gi].threads += s.threads;
+                        gacc[gi].cpuSeconds += s.cpuSeconds;
+                        ++gacc[gi].live;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // A group with nothing live leaves EVERY cell empty, including
+    // live_roles. Zero would assert that nine BOSACH processes were running
+    // and consuming nothing, which is the opposite of the truth.
+    for (size_t gi = 0; gi < groupCols_.size(); ++gi) {
+        if (gacc[gi].live == 0) continue;
+        const GroupCols& g = groupCols_[gi].second;
+        row.setNumber(g.priv, gacc[gi].priv);
+        row.setNumber(g.cpu, gacc[gi].cpu);
+        row.setNumber(g.cpuKernel, gacc[gi].cpuKernel);
+        row.setNumber(g.handles, gacc[gi].handles);
+        row.setNumber(g.threads, gacc[gi].threads);
+        row.setNumber(g.cpuSeconds, gacc[gi].cpuSeconds);
+        row.setNumber(g.live, gacc[gi].live);
+    }
+
+    // Contention: a background-tier role holding CPU at the same moment a
+    // transaction-tier role is busy. CIRCUMSTANTIAL -- the true measure is
+    // thread ready time, which Win32 does not expose without ETW. What this
+    // says is "background work ran while the transaction path was active",
+    // which is the question worth asking even though it is not proof.
+    if (anyTiered) {
+        row.setNumber(col_.txnCpu, txnCpu);
+        row.setNumber(col_.bgCpu, bgCpu);
+        if (txnCpu > cfg_.txnActivePct && bgCpu > cfg_.bgLimitPct) ++contentionTicks_;
+        row.setNumber(col_.contention, static_cast<double>(contentionTicks_));
+    }
+
+    const SystemSample ss = sys_->sample(cfg_.logDir);
+    row.setNumber(col_.sysCpu, ss.cpuPct);
+    row.setNumber(col_.sysAvail, ss.availMb);
+    row.setNumber(col_.sysTotal, ss.totalMb);
+    row.setNumber(col_.sysCommit, ss.commitPct);
+    row.setNumber(col_.diskFree, ss.diskFreeMb);
+    row.setNumber(col_.cores, ss.cores);
+    row.setNumber(col_.unknownNew, newUnknown);
+    row.setNumber(col_.budgetBreaches, breaches);
+
+    // Measured last so it reflects the whole tick. If this ever approaches
+    // the 2 ms budget, the instrument has started disturbing the measurement.
+    const double costMs = static_cast<double>(monotonicNs() - t0) / 1e6;
+    // Enumeration cost is subtracted so sample_cost_ms measures only sampling
+    // and can be checked against the 2 ms budget on every row, including the
+    // 6th. enum_cost_ms is EMPTY on ticks that did not enumerate -- empty,
+    // not zero, because "did not run" and "ran instantly" are different facts.
+    row.setNumber(col_.sampleCost, enumerated ? (costMs - lastEnumCostMs_) : costMs);
+    if (enumerated) row.setNumber(col_.enumCost, lastEnumCostMs_);
+
+    if (!sink_->write(row, today)) {
+        if (sink_->suppressed() && !warnedSuppressed_) {
+            warnedSuppressed_ = true;
+            log_.error(sink_->lastError());
+        } else if (!sink_->suppressed() && !sink_->lastError().empty()) {
+            log_.error(sink_->lastError());
+        }
+    } else if (warnedSuppressed_) {
+        warnedSuppressed_ = false;
+        log_.info("disk space recovered -- telemetry writing resumed");
+    }
+
+    if (ipc_) ipc_->publishSnapshot(snapshotJson(row));
+
+    if (!(lastPurgeDate_ == today)) {
+        lastPurgeDate_ = today;
+        // Purge FIRST, then archive. The other order compresses files that
+        // are about to be deleted, spending CPU on nothing. archiveOldFiles
+        // also refuses past-retention files on its own, so the ordering is a
+        // saving rather than a correctness requirement -- but it is free.
+        const int removed = sink_->purgeOldFiles(today);
+        if (removed > 0)
+            log_.info("retention: permanently removed " + std::to_string(removed) +
+                      " file(s) older than " + std::to_string(cfg_.retentionDays) + " days");
+        const int archived = sink_->archiveOldFiles(today);
+        if (archived > 0)
+            log_.info("retention: archived " + std::to_string(archived) + " file(s) older than " +
+                      std::to_string(cfg_.archiveAfterDays) + " days");
+        log_.info("retention: telemetry footprint now " +
+                  std::to_string(sink_->bytesOnDisk() / 1048576) + " MB");
+    }
+
+    if (newUnknown > 0)
+        log_.info("discovery: " + std::to_string(newUnknown) + " new binary/binaries recorded");
+
+    ++tick_;
+}
+
+std::string Agent::snapshotJson(const Row& r) const {
+    // The panel reads this rather than sampling for itself, so the panel and
+    // the CSV can never disagree, and opening the panel cannot change what
+    // gets logged.
+    std::string out = "{";
+    bool first = true;
+    for (size_t i = 0; i < schema_.size(); ++i) {
+        const Cell& c = r.at(i);
+        if (c.empty()) continue;
+        if (!first) out.push_back(',');
+        first = false;
+        out += '"' + schema_.name(i) + "\":";
+        if (c.kind() == Cell::Kind::Text) {
+            out.push_back('"');
+            for (char ch : c.txt()) {
+                if (ch == '"' || ch == '\\') out.push_back('\\');
+                out.push_back(ch);
+            }
+            out.push_back('"');
+        } else {
+            out += c.toCsv(schema_.precision(i));
+        }
+    }
+    out.push_back('}');
+    return out;
+}
+
+}  // namespace ev
+***********
+Archive.cpp
+#include "edgevitals/Archive.h"
+
+#include <cstring>
+
+namespace ev {
+namespace {
+
+// ── CRC32 (IEEE 802.3, the polynomial ZIP uses) ──────────────────────────
+struct Crc32Table {
+    std::uint32_t t[256];
+    Crc32Table() {
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k)
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            t[i] = c;
+        }
+    }
+};
+const Crc32Table kCrc;
+
+// ── bit writer ───────────────────────────────────────────────────────────
+// DEFLATE packs bits into bytes starting at the least-significant bit. Huffman
+// codes are the one exception: they are written most-significant bit first,
+// which is why putCode reverses them.
+class BitWriter {
+public:
+    explicit BitWriter(std::vector<std::uint8_t>& out) : out_(out) {}
+
+    void putBits(std::uint32_t value, int count) {
+        bits_ |= static_cast<std::uint64_t>(value) << nbits_;
+        nbits_ += count;
+        while (nbits_ >= 8) {
+            out_.push_back(static_cast<std::uint8_t>(bits_ & 0xFFu));
+            bits_ >>= 8;
+            nbits_ -= 8;
+        }
+    }
+
+    // Huffman code, MSB first.
+    void putCode(std::uint32_t code, int count) {
+        for (int i = count - 1; i >= 0; --i)
+            putBits((code >> i) & 1u, 1);
+    }
+
+    void flushByte() {
+        if (nbits_ > 0) {
+            out_.push_back(static_cast<std::uint8_t>(bits_ & 0xFFu));
+            bits_ = 0;
+            nbits_ = 0;
+        }
+    }
+
+private:
+    std::vector<std::uint8_t>& out_;
+    std::uint64_t bits_ = 0;
+    int nbits_ = 0;
+};
+
+// ── fixed Huffman code tables (RFC 1951 section 3.2.6) ───────────────────
+void literalCode(int sym, std::uint32_t& code, int& len) {
+    if (sym <= 143)      { code = 0x30u + sym;              len = 8; }
+    else if (sym <= 255) { code = 0x190u + (sym - 144);     len = 9; }
+    else if (sym <= 279) { code = static_cast<std::uint32_t>(sym - 256); len = 7; }
+    else                 { code = 0xC0u + (sym - 280);      len = 8; }
+}
+
+// Length codes 257-285.
+const std::uint16_t kLenBase[29] = {
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59,
+    67, 83, 99, 115, 131, 163, 195, 227, 258};
+const std::uint8_t kLenExtra[29] = {
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+    4, 4, 4, 4, 5, 5, 5, 5, 0};
+
+// Distance codes 0-29.
+const std::uint16_t kDistBase[30] = {
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513,
+    769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+const std::uint8_t kDistExtra[30] = {
+    0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8,
+    9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+
+int lengthCodeIndex(int len) {
+    for (int i = 28; i >= 0; --i)
+        if (len >= kLenBase[i]) return i;
+    return 0;
+}
+
+int distCodeIndex(int dist) {
+    for (int i = 29; i >= 0; --i)
+        if (dist >= kDistBase[i]) return i;
+    return 0;
+}
+
+// ── LZ77 with a hash chain ───────────────────────────────────────────────
+constexpr int kWindow = 32768;
+constexpr int kMinMatch = 3;
+constexpr int kMaxMatch = 258;
+constexpr int kHashBits = 15;
+constexpr int kHashSize = 1 << kHashBits;
+// Bounded chain walk. Telemetry CSV is highly repetitive, so long chains are
+// common and an unbounded search turns compression from milliseconds into
+// seconds. 32 is the point past which the ratio stops moving on this data.
+constexpr int kMaxChain = 32;
+
+inline std::uint32_t hash3(const std::uint8_t* p) {
+    return ((static_cast<std::uint32_t>(p[0]) << 10) ^
+            (static_cast<std::uint32_t>(p[1]) << 5) ^
+            static_cast<std::uint32_t>(p[2])) & (kHashSize - 1);
+}
+
+}  // namespace
+
+std::uint32_t crc32Of(const std::uint8_t* data, std::size_t n, std::uint32_t seed) {
+    std::uint32_t c = seed ^ 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < n; ++i)
+        c = kCrc.t[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+std::vector<std::uint8_t> deflateRaw(const std::uint8_t* data, std::size_t n) {
+    std::vector<std::uint8_t> out;
+    out.reserve(n / 3 + 64);
+    BitWriter bw(out);
+
+    // Single fixed-Huffman block covering the whole input.
+    bw.putBits(1, 1);   // BFINAL
+    bw.putBits(1, 2);   // BTYPE = 01, fixed Huffman
+
+    if (n == 0) {
+        std::uint32_t c; int l;
+        literalCode(256, c, l);
+        bw.putCode(c, l);
+        bw.flushByte();
+        return out;
+    }
+
+    // prev[] is indexed circularly over the 32 KB LZ77 window, not over the
+    // whole input. A match can never be further back than kWindow, so entries
+    // beyond that are unreachable -- and a flat prev[n] costs 4 bytes per
+    // input byte, which on a 7.4 MB day file is ~30 MB of transient against a
+    // 15 MB self-budget. Circular makes it a fixed 128 KB.
+    std::vector<int> head(kHashSize, -1);
+    std::vector<int> prev(kWindow, -1);
+    const std::size_t kWinMask = static_cast<std::size_t>(kWindow) - 1;
+
+    std::size_t pos = 0;
+    while (pos < n) {
+        int bestLen = 0, bestDist = 0;
+
+        if (pos + kMinMatch <= n) {
+            const std::uint32_t h = hash3(data + pos);
+            int cand = head[h];
+            int chain = kMaxChain;
+            const std::size_t maxLen = (n - pos) < static_cast<std::size_t>(kMaxMatch)
+                                           ? (n - pos)
+                                           : static_cast<std::size_t>(kMaxMatch);
+            while (cand >= 0 && chain-- > 0) {
+                const std::size_t dist = pos - static_cast<std::size_t>(cand);
+                if (dist > static_cast<std::size_t>(kWindow)) break;
+                // Cheap reject before the memcmp-style walk.
+                if (bestLen >= kMinMatch &&
+                    data[cand + static_cast<std::size_t>(bestLen)] !=
+                        data[pos + static_cast<std::size_t>(bestLen)]) {
+                    cand = prev[static_cast<std::size_t>(cand) & kWinMask];
+                    continue;
+                }
+                std::size_t l = 0;
+                while (l < maxLen && data[cand + l] == data[pos + l]) ++l;
+                if (static_cast<int>(l) > bestLen) {
+                    bestLen = static_cast<int>(l);
+                    bestDist = static_cast<int>(dist);
+                    if (bestLen >= kMaxMatch) break;
+                }
+                cand = prev[static_cast<std::size_t>(cand) & kWinMask];
+            }
+        }
+
+        if (bestLen >= kMinMatch) {
+            const int li = lengthCodeIndex(bestLen);
+            std::uint32_t c; int l;
+            literalCode(257 + li, c, l);
+            bw.putCode(c, l);
+            if (kLenExtra[li])
+                bw.putBits(static_cast<std::uint32_t>(bestLen - kLenBase[li]), kLenExtra[li]);
+
+            const int di = distCodeIndex(bestDist);
+            bw.putCode(static_cast<std::uint32_t>(di), 5);   // fixed 5-bit distance code
+            if (kDistExtra[di])
+                bw.putBits(static_cast<std::uint32_t>(bestDist - kDistBase[di]), kDistExtra[di]);
+
+            // Insert every position the match covers, or later matches lose
+            // the chain entries and the ratio collapses on repetitive input.
+            for (int k = 0; k < bestLen; ++k) {
+                const std::size_t p = pos + static_cast<std::size_t>(k);
+                if (p + kMinMatch <= n) {
+                    const std::uint32_t hh = hash3(data + p);
+                    prev[p & kWinMask] = head[hh];
+                    head[hh] = static_cast<int>(p);
+                }
+            }
+            pos += static_cast<std::size_t>(bestLen);
+        } else {
+            std::uint32_t c; int l;
+            literalCode(data[pos], c, l);
+            bw.putCode(c, l);
+            if (pos + kMinMatch <= n) {
+                const std::uint32_t hh = hash3(data + pos);
+                prev[pos & kWinMask] = head[hh];
+                head[hh] = static_cast<int>(pos);
+            }
+            ++pos;
+        }
+    }
+
+    std::uint32_t c; int l;
+    literalCode(256, c, l);   // end of block
+    bw.putCode(c, l);
+    bw.flushByte();
+    return out;
+}
+
+namespace {
+
+void put16(std::vector<std::uint8_t>& v, std::uint32_t x) {
+    v.push_back(static_cast<std::uint8_t>(x & 0xFFu));
+    v.push_back(static_cast<std::uint8_t>((x >> 8) & 0xFFu));
+}
+
+void put32(std::vector<std::uint8_t>& v, std::uint32_t x) {
+    put16(v, x & 0xFFFFu);
+    put16(v, (x >> 16) & 0xFFFFu);
+}
+
+std::uint16_t dosTime(const ZipEntry& e) {
+    return static_cast<std::uint16_t>((e.hour << 11) | (e.minute << 5) | (e.second / 2));
+}
+
+std::uint16_t dosDate(const ZipEntry& e) {
+    int y = e.year - 1980;
+    if (y < 0) y = 0;
+    return static_cast<std::uint16_t>((y << 9) | (e.month << 5) | e.day);
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> buildZip(const std::vector<ZipEntry>& entries) {
+    std::vector<std::uint8_t> out;
+    struct Central {
+        std::uint32_t crc, csize, usize, offset;
+        std::uint16_t method, time, date;
+        std::string name;
+    };
+    std::vector<Central> central;
+    central.reserve(entries.size());
+
+    for (const auto& e : entries) {
+        const std::uint32_t usize = static_cast<std::uint32_t>(e.data.size());
+        const std::uint32_t crc = crc32Of(e.data.data(), e.data.size());
+
+        std::vector<std::uint8_t> comp = deflateRaw(e.data.data(), e.data.size());
+        std::uint16_t method = 8;
+        // A deflate stream larger than the input happens on incompressible or
+        // tiny content. Storing is still a valid entry; refusing to archive
+        // would be the worse outcome.
+        if (comp.size() >= e.data.size()) {
+            comp = e.data;
+            method = 0;
+        }
+
+        Central c;
+        c.crc = crc;
+        c.csize = static_cast<std::uint32_t>(comp.size());
+        c.usize = usize;
+        c.offset = static_cast<std::uint32_t>(out.size());
+        c.method = method;
+        c.time = dosTime(e);
+        c.date = dosDate(e);
+        c.name = e.name;
+
+        put32(out, 0x04034B50u);          // local file header
+        put16(out, 20);                   // version needed
+        put16(out, 0);                    // flags
+        put16(out, method);
+        put16(out, c.time);
+        put16(out, c.date);
+        put32(out, crc);
+        put32(out, c.csize);
+        put32(out, c.usize);
+        put16(out, static_cast<std::uint32_t>(e.name.size()));
+        put16(out, 0);                    // extra length
+        out.insert(out.end(), e.name.begin(), e.name.end());
+        out.insert(out.end(), comp.begin(), comp.end());
+
+        central.push_back(std::move(c));
+    }
+
+    const std::uint32_t cdOffset = static_cast<std::uint32_t>(out.size());
+    for (const auto& c : central) {
+        put32(out, 0x02014B50u);          // central directory header
+        put16(out, 20);                   // version made by
+        put16(out, 20);                   // version needed
+        put16(out, 0);                    // flags
+        put16(out, c.method);
+        put16(out, c.time);
+        put16(out, c.date);
+        put32(out, c.crc);
+        put32(out, c.csize);
+        put32(out, c.usize);
+        put16(out, static_cast<std::uint32_t>(c.name.size()));
+        put16(out, 0);                    // extra
+        put16(out, 0);                    // comment
+        put16(out, 0);                    // disk number
+        put16(out, 0);                    // internal attrs
+        put32(out, 0);                    // external attrs
+        put32(out, c.offset);
+        out.insert(out.end(), c.name.begin(), c.name.end());
+    }
+    const std::uint32_t cdSize = static_cast<std::uint32_t>(out.size()) - cdOffset;
+
+    put32(out, 0x06054B50u);              // end of central directory
+    put16(out, 0);
+    put16(out, 0);
+    put16(out, static_cast<std::uint32_t>(central.size()));
+    put16(out, static_cast<std::uint32_t>(central.size()));
+    put32(out, cdSize);
+    put32(out, cdOffset);
+    put16(out, 0);                        // comment length
+    return out;
+}
+
+}  // namespace ev
+***********
+Config.cpp
+#include "edgevitals/Config.h"
+
+#include <fstream>
+#include <sstream>
+
+#include "edgevitals/Json.h"
+
+namespace ev {
+
+Config Config::defaults() {
+    Config c{};
+    // Fallback only -- used when the config file is missing or unreadable. Every
+    // field is spelled out, including tier: an aggregate initialiser that stops
+    // short leaves the rest default-constructed, which is correct but produces
+    // a -Wmissing-field-initializers warning per row and hides the day someone
+    // adds a field that should NOT default.
+    //
+    // Tier matters even here. If the config is gone and the agent falls back to
+    // this table, contention accounting should still work rather than silently
+    // going dark.
+    c.tracked = {
+        //  role        exe                                            label                  ram   cpu  gui    group          self   tier
+        {"ui",       {"EdgeTerminalDemo.exe", "EdgeTerminal.exe"}, "EdgeTerminal",         260,  20, true,  "bosach",      false, "transaction"},
+        {"vision",   {"edgesignal-vision.exe"},                    "EdgeSignal-Vision",    220,  60, false, "bosach",      false, "background"},
+        {"piper",    {"piper.exe"},                                "Piper TTS",            150, 100, false, "bosach",      false, "interactive"},
+        {"rhubarb",  {"rhubarb.exe"},                              "Rhubarb lip-sync",      60, 100, false, "bosach",      false, "interactive"},
+        {"content",  {"edgesignal-content.exe"},                   "EdgeSignal-Content",    60,  20, false, "bosach",      false, "background"},
+        {"campaign", {"edgecampaign.exe"},                         "EdgeCampaign",          50,  10, false, "bosach",      false, "background"},
+        {"monitor",  {"edgemonitor.exe", "apex-edge.exe"},         "EdgeMonitor",          260,  60, false, "bosach",      false, "background"},
+        {"nats",     {"nats-server.exe"},                          "NATS leaf",             45,   5, false, "bosach",      false, "transaction"},
+        {"bastion",  {"edgebastion.exe"},                          "EdgeBastion",           40,  10, false, "bosach",      false, "transaction"},
+        {"clamd",    {"clamd.exe", "clamscan.exe"},                "ClamAV",                 0,   0, false, "environment", false, "background"},
+        {"vitals",   {"edgevitals.exe"},                           "EdgeVitals (self)",     15,   1, false, "bosach",      true,  "interactive"},
+    };
+    c.extraColumns = {
+        {"state",             0, true},
+        {"persona",           0, true},
+        {"theme",             0, true},
+        {"frame_p50_ms",      2, false},
+        {"frame_p95_ms",      2, false},
+        {"frame_p99_ms",      2, false},
+        {"frame_max_ms",      2, false},
+        {"frames_total",      0, false},
+        {"frames_over_33ms",  0, false},
+        {"tts_synth_ms",      1, false},
+        {"tts_chars",         0, false},
+        {"rhubarb_ms",        1, false},
+        {"asr_partial_ms",    1, false},
+        {"audio_underruns",   0, false},
+        {"cam_face_fps",      1, false},
+        {"cam_slot_fps",      1, false},
+        {"cam_lobby_fps",     1, false},
+        {"cam_drops",         0, false},
+        {"vision_proc_p95_ms", 2, false},
+        {"feed_mbs",          2, false},
+        {"feed_queue_depth",  0, false},
+    };
+    c.systemAllowlist = {
+        "system", "smss.exe", "csrss.exe", "wininit.exe", "services.exe",
+        "lsass.exe", "winlogon.exe", "svchost.exe", "explorer.exe",
+        "dwm.exe", "fontdrvhost.exe", "spoolsv.exe", "taskhostw.exe",
+        "sihost.exe", "ctfmon.exe", "runtimebroker.exe", "conhost.exe",
+        "registry", "memory compression", "dllhost.exe", "searchindexer.exe",
+    };
+    return c;
+}
+
+static std::string readFile(const std::string& path, bool& ok) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) { ok = false; return {}; }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    ok = true;
+    return ss.str();
+}
+
+bool Config::load(const std::string& path, std::string& err) {
+    sourcePath = path;
+    bool ok = false;
+    const std::string text = readFile(path, ok);
+    if (!ok) { err = "cannot open " + path; return false; }
+
+    Json root;
+    std::string perr;
+    if (!Json::parse(text, root, perr)) { err = path + ": " + perr; return false; }
+    if (!root.isObject()) { err = path + ": top level must be an object"; return false; }
+
+    // Build into a scratch copy so a failure part-way leaves *this untouched.
+    Config c = Config::defaults();
+
+    const Json& s = root["sampling"];
+    c.intervalMs = static_cast<int>(s["interval_ms"].asInt(c.intervalMs));
+    c.enumerateEveryTicks =
+        static_cast<int>(s["enumerate_every_ticks"].asInt(c.enumerateEveryTicks));
+    if (c.intervalMs < 1000) { err = "sampling.interval_ms below 1000 is not supported"; return false; }
+    if (c.enumerateEveryTicks < 1) c.enumerateEveryTicks = 1;
+
+    const Json& o = root["output"];
+    c.logDir = o["dir"].asString(c.logDir);
+    c.filePrefix = o["prefix"].asString(c.filePrefix);
+    c.retentionDays = static_cast<int>(o["retention_days"].asInt(c.retentionDays));
+    c.archiveAfterDays = static_cast<int>(o["archive_after_days"].asInt(c.archiveAfterDays));
+    c.archiveMaxMb = static_cast<int>(o["archive_max_mb"].asInt(c.archiveMaxMb));
+    c.txnActivePct = o["txn_active_pct"].asNumber(c.txnActivePct);
+    c.bgLimitPct = o["bg_limit_pct"].asNumber(c.bgLimitPct);
+    c.diskFloorMb = o["disk_floor_mb"].asNumber(c.diskFloorMb);
+    c.flushEveryTick = o["flush_every_tick"].asBool(c.flushEveryTick);
+    if (c.retentionDays < 1) c.retentionDays = 1;
+
+    const Json& d = root["discovery"];
+    c.discoverUnknown = d["enabled"].asBool(c.discoverUnknown);
+    c.discoveryFile = d["file"].asString(c.discoveryFile);
+    if (d["system_allowlist"].isArray()) {
+        c.systemAllowlist.clear();
+        for (size_t i = 0; i < d["system_allowlist"].size(); ++i)
+            c.systemAllowlist.push_back(d["system_allowlist"][i].asString());
+    }
+
+    const Json& ipc = root["ipc"];
+    c.ipcEnabled = ipc["enabled"].asBool(c.ipcEnabled);
+    c.pipeName = ipc["pipe"].asString(c.pipeName);
+    c.ipcClientSid = ipc["client_sid"].asString(c.ipcClientSid);
+    c.ipcMaxClients = static_cast<int>(ipc["max_clients"].asInt(c.ipcMaxClients));
+    c.ipcAllowSnapshot = ipc["allow_snapshot"].asBool(c.ipcAllowSnapshot);
+    if (ipc["extra_columns"].isArray()) {
+        c.extraColumns.clear();
+        for (size_t i = 0; i < ipc["extra_columns"].size(); ++i) {
+            const Json& e = ipc["extra_columns"][i];
+            ExtraColumn col;
+            col.name = e["name"].asString();
+            col.precision = static_cast<int>(e["precision"].asInt(2));
+            col.text = e["text"].asBool(false);
+            if (!col.name.empty()) c.extraColumns.push_back(col);
+        }
+    }
+
+    if (root["processes"].isArray()) {
+        c.tracked.clear();
+        for (size_t i = 0; i < root["processes"].size(); ++i) {
+            const Json& p = root["processes"][i];
+            TrackedProcess t;
+            t.role = p["role"].asString();
+            t.label = p["label"].asString(t.role);
+            t.ramBudgetMb = p["ram_budget_mb"].asNumber(0.0);
+            t.cpuBudgetPct = p["cpu_budget_pct"].asNumber(0.0);
+            t.gui = p["gui"].asBool(false);
+            t.group = p["group"].asString();
+            t.self = p["self"].asBool(false);
+            t.tier = p["tier"].asString();
+            const Json& ex = p["exe"];
+            if (ex.isArray())
+                for (size_t k = 0; k < ex.size(); ++k) t.exe.push_back(ex[k].asString());
+            else if (!ex.asString().empty())
+                t.exe.push_back(ex.asString());
+            if (t.role.empty()) { err = "processes[" + std::to_string(i) + "] has no role"; return false; }
+            if (t.exe.empty()) { err = "process role '" + t.role + "' has no exe list"; return false; }
+            c.tracked.push_back(std::move(t));
+        }
+    }
+
+    // The scratch copy came from defaults() and does not know where it was
+    // loaded from. Carry the path across the swap, or config_hash ends up
+    // hashing nothing and every file reports the same value.
+    c.sourcePath = path;
+    *this = std::move(c);
+    return true;
+}
+
+}  // namespace ev
+***********
+CsvSink.cpp
+#include "edgevitals/CsvSink.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
+#include <vector>
+
+#include "edgevitals/Archive.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <aclapi.h>
+#include <sddl.h>
+#endif
+
+namespace fs = std::filesystem;
+
+namespace ev {
+
+std::string Date::iso() const {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", y, m, d);
+    return buf;
+}
+
+bool Date::parseIso(const std::string& s, Date& out) {
+    if (s.size() != 10 || s[4] != '-' || s[7] != '-') return false;
+    for (size_t i : {0u, 1u, 2u, 3u, 5u, 6u, 8u, 9u})
+        if (s[i] < '0' || s[i] > '9') return false;
+    Date d;
+    d.y = std::atoi(s.substr(0, 4).c_str());
+    d.m = std::atoi(s.substr(5, 2).c_str());
+    d.d = std::atoi(s.substr(8, 2).c_str());
+    if (d.m < 1 || d.m > 12 || d.d < 1 || d.d > 31) return false;
+    out = d;
+    return true;
+}
+
+long long Date::serial() const {
+    // Howard Hinnant's days_from_civil. Correct across leap years and
+    // century boundaries, which a naive y*365 + m*30 + d is not -- and
+    // retention silently keeping an extra day around a leap year is exactly
+    // the kind of bug nobody finds.
+    long long yy = y;
+    unsigned mm = static_cast<unsigned>(m);
+    unsigned dd = static_cast<unsigned>(d);
+    yy -= mm <= 2;
+    const long long era = (yy >= 0 ? yy : yy - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(yy - era * 400);
+    const unsigned doy = (153 * (mm + (mm > 2 ? -3 : 9)) + 2) / 5 + dd - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<long long>(doe) - 719468;
+}
+
+CsvSink::CsvSink(Options opts, const Schema& schema, std::shared_ptr<IDiskSpace> disk)
+    : opts_(std::move(opts)), schema_(schema), disk_(std::move(disk)) {}
+
+CsvSink::~CsvSink() { close(); }
+
+void CsvSink::close() {
+    if (fp_) {
+        std::fclose(fp_);
+        fp_ = nullptr;
+    }
+}
+
+bool CsvSink::openFor(const Date& d) {
+    close();
+    std::error_code ec;
+    const bool fresh = !fs::exists(opts_.dir, ec);
+    fs::create_directories(opts_.dir, ec);
+    if (fresh && opts_.restrictLogAcl) applyLogDirAcl();
+    if (ec) {
+        lastError_ = "cannot create log dir " + opts_.dir + ": " + ec.message();
+        return false;
+    }
+
+    const std::string name = opts_.prefix + "-" + d.iso() + ".csv";
+    path_ = (fs::path(opts_.dir) / name).string();
+
+    const bool existed = fs::exists(path_, ec) && fs::file_size(path_, ec) > 0;
+    fp_ = std::fopen(path_.c_str(), "ab");
+    if (!fp_) {
+        lastError_ = "cannot open " + path_;
+        return false;
+    }
+    // Header only on a genuinely new file. Reopening after a service restart
+    // mid-day must append, not write a second header into the middle.
+    if (!existed) {
+        const std::string h = schema_.headerCsv();
+        std::fwrite(h.data(), 1, h.size(), fp_);
+        std::fputc('\n', fp_);
+        std::fflush(fp_);
+    }
+    openDate_ = d;
+    lastError_.clear();
+    return true;
+}
+
+bool CsvSink::write(const Row& row, const Date& today) {
+    if (disk_) freeMb_ = disk_->freeMbAt(opts_.dir);
+
+    if (freeMb_ > 0.0 && freeMb_ < opts_.diskFloorMb) {
+        if (!suppressed_) {
+            suppressed_ = true;
+            lastError_ = "disk below floor (" + std::to_string(static_cast<long long>(freeMb_)) +
+                         " MB free, floor " + std::to_string(static_cast<long long>(opts_.diskFloorMb)) +
+                         " MB) -- telemetry writing suspended";
+            close();
+        }
+        return false;
+    }
+    if (suppressed_) {
+        suppressed_ = false;
+        lastError_.clear();
+    }
+
+    if (!fp_ || openDate_ != today) {
+        const bool rotating = (fp_ != nullptr);
+        if (!openFor(today)) return false;
+        if (rotating) purgeOldFiles(today);
+    }
+
+    // One buffered write per row. The row is assembled in memory first so a
+    // partially-written line cannot appear if the process is killed mid-tick.
+    std::string line = row.toCsv();
+    line.push_back('\n');
+    const size_t n = std::fwrite(line.data(), 1, line.size(), fp_);
+    if (n != line.size()) {
+        lastError_ = "short write to " + path_;
+        return false;
+    }
+    if (opts_.flushEveryTick) std::fflush(fp_);
+    return true;
+}
+
+namespace {
+
+// Recognises prefix-YYYY-MM-DD.csv and prefix-YYYY-MM-DD.csv.zip and nothing
+// else. Anything whose date cannot be parsed out of its own name belongs to
+// somebody else and is never touched -- deleting a stranger's file because it
+// happened to share a directory is not a recoverable mistake.
+bool classify(const std::string& name, const std::string& pre, Date& d, bool& isZip) {
+    const std::string csv = ".csv", zip = ".csv.zip";
+    if (name.compare(0, pre.size(), pre) != 0) return false;
+    if (name.size() == pre.size() + 10 + csv.size() &&
+        name.compare(name.size() - csv.size(), csv.size(), csv) == 0) {
+        isZip = false;
+    } else if (name.size() == pre.size() + 10 + zip.size() &&
+               name.compare(name.size() - zip.size(), zip.size(), zip) == 0) {
+        isZip = true;
+    } else {
+        return false;
+    }
+    return Date::parseIso(name.substr(pre.size(), 10), d);
+}
+
+}  // namespace
+
+void CsvSink::applyLogDirAcl() {
+#ifdef _WIN32
+    // A protected, non-inheriting DACL: SYSTEM and Administrators, full
+    // control, inherited by files created inside. SetNamedSecurityInfo with
+    // PROTECTED_DACL_SECURITY_INFORMATION drops whatever the parent directory
+    // would otherwise hand down, which is the point -- the exe may have been
+    // unpacked anywhere.
+    //
+    // "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+    //   PA  protected, no inherited ACEs
+    //   AI  auto-inherit flag set on children
+    //   OICI object + container inherit, so new CSVs get it too
+    //   FA  full access
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)", SDDL_REVISION_1, &sd, nullptr)) {
+        lastError_ = "log ACL: SDDL parse failed";
+        return;
+    }
+    BOOL present = FALSE, defaulted = FALSE;
+    PACL dacl = nullptr;
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present) {
+        const DWORD r = SetNamedSecurityInfoA(
+            const_cast<LPSTR>(opts_.dir.c_str()), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            nullptr, nullptr, dacl, nullptr);
+        // Not fatal. Losing telemetry is worse than a loose ACL, so this is
+        // recorded and execution continues.
+        if (r != ERROR_SUCCESS)
+            lastError_ = "log ACL: SetNamedSecurityInfo failed (" + std::to_string(r) + ")";
+    }
+    LocalFree(sd);
+#endif
+}
+
+int CsvSink::purgeOldFiles(const Date& today) {
+    std::error_code ec;
+    if (!fs::exists(opts_.dir, ec)) return 0;
+
+    const std::string pre = opts_.prefix + "-";
+    const long long cutoff = today.serial() - opts_.retentionDays;
+    const std::string todayName = fs::path(path_).filename().string();
+    int removed = 0;
+
+    for (const auto& entry : fs::directory_iterator(opts_.dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string name = entry.path().filename().string();
+
+        Date d;
+        bool isZip = false;
+        if (!classify(name, pre, d, isZip)) continue;
+        if (d.serial() >= cutoff) continue;
+        if (name == todayName) continue;                 // never today's
+
+        std::error_code rm;
+        if (fs::remove(entry.path(), rm)) ++removed;
+    }
+    return removed;
+}
+
+int CsvSink::archiveOldFiles(const Date& today) {
+    if (opts_.archiveAfterDays <= 0) return 0;
+    std::error_code ec;
+    if (!fs::exists(opts_.dir, ec)) return 0;
+
+    const std::string pre = opts_.prefix + "-";
+    const long long cutoff = today.serial() - opts_.archiveAfterDays;
+    const std::string todayName = fs::path(path_).filename().string();
+    int archived = 0;
+
+    // Collect first. Compressing while iterating a directory that is being
+    // mutated is undefined on some filesystems.
+    std::vector<fs::path> candidates;
+    for (const auto& entry : fs::directory_iterator(opts_.dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string name = entry.path().filename().string();
+        Date d;
+        bool isZip = false;
+        if (!classify(name, pre, d, isZip)) continue;
+        if (isZip) continue;                             // already archived
+        if (d.serial() >= cutoff) continue;              // inside the raw window
+        if (name == todayName) continue;
+        // Already past retention: purge will delete it. Compressing first
+        // would spend CPU on a file that is about to cease to exist. Holds
+        // regardless of the order the caller invokes archive and purge in.
+        if (d.serial() < today.serial() - opts_.retentionDays) continue;
+        candidates.push_back(entry.path());
+    }
+
+    for (const auto& src : candidates) {
+        std::error_code e2;
+        const auto sz = fs::file_size(src, e2);
+        if (e2) continue;
+        // A file bigger than the ZIP32 field can express would produce a
+        // silently wrong archive. Leave it raw and let retention deal with it.
+        const unsigned long long capBytes =
+            static_cast<unsigned long long>(opts_.archiveMaxMb) * 1048576ull;
+        if (sz > 0xFFFFFFFFull || (opts_.archiveMaxMb > 0 && sz > capBytes)) {
+            // Left raw on purpose. Compression peaks near 3x the file size in
+            // transient memory; a pathological day file must not take the
+            // agent -- or the terminal -- down to save disk.
+            lastError_ = "skipped archive of oversized " + src.filename().string() +
+                         " (" + std::to_string(sz / 1048576ull) + " MB > " +
+                         std::to_string(opts_.archiveMaxMb) + " MB cap)";
+            continue;
+        }
+
+        std::ifstream in(src.string(), std::ios::binary);
+        if (!in) continue;
+        std::vector<std::uint8_t> buf(static_cast<size_t>(sz));
+        if (sz > 0) in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(sz));
+        if (!in && sz > 0) continue;
+        in.close();
+
+        Date d;
+        bool isZip = false;
+        classify(src.filename().string(), pre, d, isZip);
+
+        ZipEntry ze;
+        ze.name = src.filename().string();
+        ze.data = std::move(buf);
+        ze.year = d.y;
+        ze.month = d.m;
+        ze.day = d.d;
+
+        const std::vector<std::uint8_t> zbytes = buildZip({ze});
+
+        // .tmp -> fsync -> rename -> delete original. At no point does a
+        // window exist where neither a readable CSV nor a complete archive is
+        // on disk.
+        const fs::path tmp = src.string() + ".zip.tmp";
+        const fs::path dst = src.string() + ".zip";
+        {
+            std::FILE* f = std::fopen(tmp.string().c_str(), "wb");
+            if (!f) continue;
+            const size_t w = std::fwrite(zbytes.data(), 1, zbytes.size(), f);
+            std::fflush(f);
+            std::fclose(f);
+            if (w != zbytes.size()) {
+                std::error_code rmv;
+                fs::remove(tmp, rmv);
+                continue;
+            }
+        }
+        std::error_code mv;
+        fs::rename(tmp, dst, mv);
+        if (mv) {
+            std::error_code rmv;
+            fs::remove(tmp, rmv);
+            continue;
+        }
+        std::error_code rmSrc;
+        if (fs::remove(src, rmSrc)) ++archived;
+    }
+    return archived;
+}
+
+long long CsvSink::bytesOnDisk() const {
+    std::error_code ec;
+    if (!fs::exists(opts_.dir, ec)) return 0;
+    const std::string pre = opts_.prefix + "-";
+    long long total = 0;
+    for (const auto& entry : fs::directory_iterator(opts_.dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        Date d;
+        bool isZip = false;
+        if (!classify(entry.path().filename().string(), pre, d, isZip)) continue;
+        std::error_code e2;
+        const auto sz = fs::file_size(entry.path(), e2);
+        if (!e2) total += static_cast<long long>(sz);
+    }
+    return total;
+}
+
+}  // namespace ev
+***********
+IpcServer.cpp
+#include "edgevitals/IpcServer.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <sddl.h>
+
+#include <algorithm>
+
+#include "edgevitals/Json.h"
+
+namespace ev {
+
+IpcServer::IpcServer(std::string pipeName, std::vector<std::string> acceptedKeys)
+    : pipeName_(std::move(pipeName)), accepted_(std::move(acceptedKeys)) {
+    std::sort(accepted_.begin(), accepted_.end());
+}
+
+IpcServer::~IpcServer() { stop(); }
+
+bool IpcServer::start() {
+    if (running_.load()) return true;
+    stopEvent_ = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent_) {
+        lastError_ = "CreateEvent failed";
+        return false;
+    }
+    running_.store(true);
+    listener_ = std::thread([this] { listenLoop(); });
+    return true;
+}
+
+void IpcServer::stop() {
+    if (!running_.load()) return;
+    running_.store(false);
+    if (stopEvent_) SetEvent(static_cast<HANDLE>(stopEvent_));
+    // Unblock a ConnectNamedPipe that is waiting with no client by connecting
+    // to our own pipe once. Without this the listener thread would sit until
+    // a client happened to arrive, and service shutdown would hang.
+    HANDLE poke = CreateFileA(pipeName_.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (poke != INVALID_HANDLE_VALUE) CloseHandle(poke);
+    if (listener_.joinable()) listener_.join();
+    if (stopEvent_) {
+        CloseHandle(static_cast<HANDLE>(stopEvent_));
+        stopEvent_ = nullptr;
+    }
+}
+
+void IpcServer::listenLoop() {
+    // SDDL rather than a NULL DACL. A NULL DACL grants everyone full control,
+    // which on an ATM is an audit finding waiting to happen. This grants
+    // SYSTEM and Administrators full access and authenticated users
+    // read/write -- enough for a session-1 UI to reach a session-0 service,
+    // which is what this needs once the agent is installed as a service.
+    // A named pipe is reachable remotely as \\<host>\pipe\<name> through IPC$,
+    // so the DACL is the only thing standing between this pipe and every
+    // account on the bank's network. Two changes from the first cut:
+    //
+    //   NU denied first. Network Logon Users covers anyone arriving over SMB.
+    //   A deny ACE placed ahead of the allows makes remote access impossible
+    //   regardless of what the client SID resolves to.
+    //
+    //   The client SID is configurable and should be narrowed to the account
+    //   EdgeTerminal runs as. Authenticated Users is the default only because
+    //   it is the loosest thing that works out of the box; on a domain-joined
+    //   ATM it means every domain account.
+    SECURITY_ATTRIBUTES sa{};
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    const std::string sddlStr =
+        "D:(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;" + clientSid_ + ")";
+    const char* sddl = sddlStr.c_str();
+    const bool haveSd =
+        ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, SDDL_REVISION_1, &sd, nullptr) != 0;
+    if (!haveSd) {
+        // Refuse to fall back to an inherited descriptor. A pipe with a
+        // default DACL is not obviously wrong from the outside, which is
+        // exactly what makes it dangerous.
+        lastError_ = "SDDL parse failed for client_sid '" + clientSid_ + "'; IPC disabled";
+        running_.store(false);
+        return;
+    }
+    if (haveSd) {
+        sa.nLength = sizeof(sa);
+        sa.lpSecurityDescriptor = sd;
+        sa.bInheritHandle = FALSE;
+    }
+
+    bool first = true;
+    while (running_.load()) {
+        // FILE_FLAG_FIRST_PIPE_INSTANCE on the first creation only. Without
+        // it, anything that wins the race to create this name at boot owns
+        // the pipe and our clients connect to it instead -- and we would
+        // never notice, because CreateNamedPipe happily adds an instance to
+        // somebody else's pipe. If the name is already taken, that is a
+        // squat: stop rather than coexist with it.
+        DWORD mode = PIPE_ACCESS_DUPLEX;
+        if (first) mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+
+        HANDLE pipe = CreateNamedPipeA(
+            pipeName_.c_str(), mode,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            static_cast<DWORD>(maxClients_ > 0 ? maxClients_ : 4),
+            8192, 8192, 0, &sa);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            const DWORD e = GetLastError();
+            if (first && (e == ERROR_ACCESS_DENIED || e == ERROR_PIPE_BUSY ||
+                          e == ERROR_ALREADY_EXISTS)) {
+                lastError_ = "pipe name already owned by another process -- refusing to start IPC";
+                running_.store(false);
+                break;
+            }
+            lastError_ = "CreateNamedPipe failed";
+            Sleep(1000);
+            continue;
+        }
+        first = false;
+
+        const BOOL ok = ConnectNamedPipe(pipe, nullptr);
+        if (!running_.load()) {
+            CloseHandle(pipe);
+            break;
+        }
+        if (!ok && GetLastError() != ERROR_PIPE_CONNECTED) {
+            CloseHandle(pipe);
+            continue;
+        }
+
+        // Bounded. One process opening connections in a loop would otherwise
+        // spawn a thread each and take the agent down; the real client count
+        // is one.
+        if (maxClients_ > 0 && clients_.load() >= maxClients_) {
+            lastError_ = "client limit reached, connection refused";
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            continue;
+        }
+
+        // Detached: a wedged client must not stall the listener, and the
+        // handler owns the handle from here.
+        clients_.fetch_add(1);
+        std::thread([this, pipe] {
+            serveClient(pipe);
+            clients_.fetch_sub(1);
+        }).detach();
+    }
+
+    if (sd) LocalFree(sd);
+}
+
+void IpcServer::serveClient(void* h) {
+    HANDLE pipe = static_cast<HANDLE>(h);
+    std::string buf;
+    char chunk[1024];
+
+    while (running_.load()) {
+        DWORD got = 0;
+        if (!ReadFile(pipe, chunk, sizeof(chunk), &got, nullptr) || got == 0) break;
+        buf.append(chunk, got);
+
+        // Guard against a client that never sends a newline. Without this a
+        // malformed sender could grow this buffer until the service dies.
+        if (buf.size() > 256 * 1024) {
+            buf.clear();
+            continue;
+        }
+
+        size_t nl;
+        while ((nl = buf.find('\n')) != std::string::npos) {
+            std::string line = buf.substr(0, nl);
+            buf.erase(0, nl + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+
+            std::string reply;
+            handleLine(line, reply);
+            reply.push_back('\n');
+            DWORD wrote = 0;
+            WriteFile(pipe, reply.data(), static_cast<DWORD>(reply.size()), &wrote, nullptr);
+        }
+    }
+
+    FlushFileBuffers(pipe);
+    DisconnectNamedPipe(pipe);
+    CloseHandle(pipe);
+}
+
+void IpcServer::handleLine(const std::string& line, std::string& reply) {
+    Json j;
+    std::string err;
+    if (!Json::parse(line, j, err) || !j.isObject()) {
+        reply = "{\"ok\":0,\"err\":\"bad json\"}";
+        return;
+    }
+
+    if (j["cmd"].asString() == "snapshot") {
+        // The snapshot is the entire current row: every tracked process, its
+        // memory, and by implication the terminal's whole security stack.
+        // That is reconnaissance, so it is opt-in rather than on by default.
+        if (!allowSnapshot_) {
+            reply = "{\"ok\":0,\"err\":\"snapshot disabled\"}";
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mu_);
+        reply = snapshot_.empty() ? "{\"ok\":1,\"snapshot\":null}" : snapshot_;
+        return;
+    }
+
+    int taken = 0;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const auto& key : j.keys()) {
+            // Only configured columns are accepted. An unknown key is dropped
+            // silently: a client cannot invent a column mid-file, because a
+            // new column would desynchronise every row already written today.
+            if (!std::binary_search(accepted_.begin(), accepted_.end(), key)) continue;
+            const Json& v = j[key];
+            Value val;
+            if (v.type() == Json::Type::String) {
+                val.isText = true;
+                val.txt = v.asString();
+            } else if (v.type() == Json::Type::Number) {
+                val.num = v.asNumber();
+            } else if (v.type() == Json::Type::Bool) {
+                val.num = v.asBool() ? 1.0 : 0.0;
+            } else {
+                continue;
+            }
+            pending_[key] = std::move(val);
+            ++taken;
+        }
+    }
+    reply = "{\"ok\":1,\"taken\":" + std::to_string(taken) + "}";
+}
+
+std::map<std::string, IpcServer::Value> IpcServer::drain() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::map<std::string, Value> out;
+    out.swap(pending_);
+    return out;
+}
+
+void IpcServer::publishSnapshot(std::string json) {
+    std::lock_guard<std::mutex> lk(mu_);
+    snapshot_ = std::move(json);
+}
+
+}  // namespace ev
+***********
+Json.cpp
+#include "edgevitals/Json.h"
+
+#include <cstdlib>
+
+namespace ev {
+
+const Json Json::kNull{};
+
+bool Json::asBool(bool f) const {
+    if (type_ == Type::Bool) return bool_;
+    if (type_ == Type::Number) return num_ != 0.0;
+    return f;
+}
+
+double Json::asNumber(double f) const { return type_ == Type::Number ? num_ : f; }
+
+long long Json::asInt(long long f) const {
+    return type_ == Type::Number ? static_cast<long long>(num_) : f;
+}
+
+std::string Json::asString(const std::string& f) const {
+    return type_ == Type::String ? str_ : f;
+}
+
+const Json& Json::operator[](const std::string& k) const {
+    if (type_ != Type::Object) return kNull;
+    auto it = obj_.find(k);
+    return it == obj_.end() ? kNull : it->second;
+}
+
+const Json& Json::operator[](size_t i) const {
+    if (type_ != Type::Array || i >= arr_.size()) return kNull;
+    return arr_[i];
+}
+
+size_t Json::size() const {
+    if (type_ == Type::Array) return arr_.size();
+    if (type_ == Type::Object) return obj_.size();
+    return 0;
+}
+
+bool Json::has(const std::string& k) const {
+    return type_ == Type::Object && obj_.count(k) != 0;
+}
+
+std::vector<std::string> Json::keys() const {
+    std::vector<std::string> out;
+    if (type_ == Type::Object)
+        for (const auto& kv : obj_) out.push_back(kv.first);
+    return out;
+}
+
+// ── parser ───────────────────────────────────────────────────────────────
+class JsonParser {
+public:
+    explicit JsonParser(const std::string& s) : s_(s) {}
+
+    bool parse(Json& out, std::string& err) {
+        skip();
+        if (!value(out)) { err = error(); return false; }
+        skip();
+        if (i_ != s_.size()) { fail("trailing content after value"); err = error(); return false; }
+        return true;
+    }
+
+private:
+    const std::string& s_;
+    size_t i_ = 0;
+    size_t line_ = 1;
+    std::string msg_;
+
+    std::string error() const { return "line " + std::to_string(line_) + ": " + msg_; }
+    bool fail(const char* m) { if (msg_.empty()) msg_ = m; return false; }
+
+    void skip() {
+        for (;;) {
+            while (i_ < s_.size() &&
+                   (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\r' || s_[i_] == '\n')) {
+                if (s_[i_] == '\n') ++line_;
+                ++i_;
+            }
+            // Comments are not JSON. Every config file in this product carries
+            // explanatory comments, and a config nobody can annotate is a
+            // config nobody maintains correctly.
+            if (i_ + 1 < s_.size() && s_[i_] == '/' && s_[i_ + 1] == '/') {
+                while (i_ < s_.size() && s_[i_] != '\n') ++i_;
+                continue;
+            }
+            if (i_ + 1 < s_.size() && s_[i_] == '/' && s_[i_ + 1] == '*') {
+                i_ += 2;
+                while (i_ + 1 < s_.size() && !(s_[i_] == '*' && s_[i_ + 1] == '/')) {
+                    if (s_[i_] == '\n') ++line_;
+                    ++i_;
+                }
+                i_ = (i_ + 1 < s_.size()) ? i_ + 2 : s_.size();
+                continue;
+            }
+            return;
+        }
+    }
+
+    bool lit(const char* w) {
+        size_t n = 0;
+        while (w[n]) ++n;
+        if (s_.compare(i_, n, w) != 0) return false;
+        i_ += n;
+        return true;
+    }
+
+    bool value(Json& v) {
+        if (i_ >= s_.size()) return fail("unexpected end of input");
+        char c = s_[i_];
+        if (c == '{') return object(v);
+        if (c == '[') return array(v);
+        if (c == '"') { v.type_ = Json::Type::String; return str(v.str_); }
+        if (lit("true")) { v.type_ = Json::Type::Bool; v.bool_ = true; return true; }
+        if (lit("false")) { v.type_ = Json::Type::Bool; v.bool_ = false; return true; }
+        if (lit("null")) { v.type_ = Json::Type::Null; return true; }
+        return number(v);
+    }
+
+    bool object(Json& v) {
+        v.type_ = Json::Type::Object;
+        ++i_;
+        skip();
+        if (i_ < s_.size() && s_[i_] == '}') { ++i_; return true; }
+        for (;;) {
+            skip();
+            if (i_ >= s_.size() || s_[i_] != '"') return fail("expected object key");
+            std::string k;
+            if (!str(k)) return false;
+            skip();
+            if (i_ >= s_.size() || s_[i_] != ':') return fail("expected ':' after key");
+            ++i_;
+            skip();
+            Json child;
+            if (!value(child)) return false;
+            v.obj_[k] = std::move(child);
+            skip();
+            if (i_ < s_.size() && s_[i_] == ',') { ++i_; continue; }
+            if (i_ < s_.size() && s_[i_] == '}') { ++i_; return true; }
+            return fail("expected ',' or '}'");
+        }
+    }
+
+    bool array(Json& v) {
+        v.type_ = Json::Type::Array;
+        ++i_;
+        skip();
+        if (i_ < s_.size() && s_[i_] == ']') { ++i_; return true; }
+        for (;;) {
+            skip();
+            Json child;
+            if (!value(child)) return false;
+            v.arr_.push_back(std::move(child));
+            skip();
+            if (i_ < s_.size() && s_[i_] == ',') { ++i_; continue; }
+            if (i_ < s_.size() && s_[i_] == ']') { ++i_; return true; }
+            return fail("expected ',' or ']'");
+        }
+    }
+
+    bool str(std::string& out) {
+        out.clear();
+        ++i_;  // opening quote
+        while (i_ < s_.size()) {
+            char c = s_[i_++];
+            if (c == '"') return true;
+            if (c == '\n') { ++line_; return fail("unterminated string"); }
+            if (c != '\\') { out.push_back(c); continue; }
+            if (i_ >= s_.size()) return fail("unterminated escape");
+            char e = s_[i_++];
+            switch (e) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'u': {
+                    if (i_ + 4 > s_.size()) return fail("truncated \\u escape");
+                    unsigned cp = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        char h = s_[i_++];
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= unsigned(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= unsigned(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= unsigned(h - 'A' + 10);
+                        else return fail("bad hex in \\u escape");
+                    }
+                    // UTF-8 encode. Surrogate pairs are NOT reassembled --
+                    // config paths are ASCII in practice, and pretending
+                    // otherwise would be a correctness claim this does not earn.
+                    if (cp < 0x80) {
+                        out.push_back(char(cp));
+                    } else if (cp < 0x800) {
+                        out.push_back(char(0xC0 | (cp >> 6)));
+                        out.push_back(char(0x80 | (cp & 0x3F)));
+                    } else {
+                        out.push_back(char(0xE0 | (cp >> 12)));
+                        out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+                        out.push_back(char(0x80 | (cp & 0x3F)));
+                    }
+                    break;
+                }
+                default: return fail("unknown escape");
+            }
+        }
+        return fail("unterminated string");
+    }
+
+    bool number(Json& v) {
+        size_t start = i_;
+        if (i_ < s_.size() && (s_[i_] == '-' || s_[i_] == '+')) ++i_;
+        bool any = false;
+        while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; any = true; }
+        if (i_ < s_.size() && s_[i_] == '.') {
+            ++i_;
+            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; any = true; }
+        }
+        if (any && i_ < s_.size() && (s_[i_] == 'e' || s_[i_] == 'E')) {
+            ++i_;
+            if (i_ < s_.size() && (s_[i_] == '-' || s_[i_] == '+')) ++i_;
+            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') ++i_;
+        }
+        if (!any) return fail("expected a value");
+        v.type_ = Json::Type::Number;
+        v.num_ = std::strtod(s_.substr(start, i_ - start).c_str(), nullptr);
+        return true;
+    }
+};
+
+bool Json::parse(const std::string& text, Json& out, std::string& err) {
+    out = Json{};
+    JsonParser p(text);
+    return p.parse(out, err);
+}
+
+}  // namespace ev
+***********
+ProcessSampler.cpp
+#include "edgevitals/ProcessSampler.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
+
+#include <algorithm>
+#include <cctype>
+
+namespace ev {
+namespace {
+
+std::string toLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::uint64_t toU64(const FILETIME& ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+constexpr double kMb = 1024.0 * 1024.0;
+
+}  // namespace
+
+ProcessSampler::ProcessSampler(const Config& cfg) : cfg_(cfg) {}
+
+ProcessSampler::~ProcessSampler() {
+    for (auto& kv : bound_)
+        for (auto& t : kv.second) closeHandle(t);
+}
+
+void ProcessSampler::closeHandle(Tracked& t) {
+    if (t.handle) {
+        CloseHandle(static_cast<HANDLE>(t.handle));
+        t.handle = nullptr;
+    }
+}
+
+std::vector<ProcInfo> ProcessSampler::enumerate() {
+    std::vector<ProcInfo> out;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return out;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            ProcInfo pi;
+            pi.pid = pe.th32ProcessID;
+            pi.parentPid = pe.th32ParentProcessID;
+            pi.threads = pe.cntThreads;
+
+            // WideCharToMultiByte rather than a narrow snapshot: exe names on
+            // an ATM can carry non-ASCII from vendor installers, and a narrow
+            // API would mangle them into a name that never matches config.
+            char narrow[MAX_PATH * 2] = {0};
+            WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, narrow, sizeof(narrow) - 1,
+                                nullptr, nullptr);
+            pi.exeName = toLower(narrow);
+
+            // Full path needs a handle. Many processes refuse even to an
+            // elevated caller (protected processes); an empty path is a fact
+            // to record, not a failure to hide.
+            HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pi.pid);
+            if (h) {
+                wchar_t buf[MAX_PATH * 2];
+                DWORD n = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+                if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
+                    char p[MAX_PATH * 4] = {0};
+                    WideCharToMultiByte(CP_UTF8, 0, buf, -1, p, sizeof(p) - 1, nullptr, nullptr);
+                    pi.exePath = p;
+                }
+                CloseHandle(h);
+            }
+            out.push_back(std::move(pi));
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return out;
+}
+
+void ProcessSampler::bindRoles(const std::vector<ProcInfo>& all) {
+    // Enumeration is ground truth. A role found here is running, so clear any
+    // backoff immediately -- a process that just started must not wait out a
+    // 5-minute timer set while it was absent.
+    for (auto& kv : bound_) {
+        for (auto& t : kv.second) { t.openFails = 0; t.retryAtTick = 0; }
+    }
+    const unsigned long selfPid = GetCurrentProcessId();
+    for (const auto& tp : cfg_.tracked) {
+        std::vector<unsigned long> pids;
+        std::unordered_map<unsigned long, unsigned long> threadsByPid;
+        if (tp.self) {
+            // Bind by PID. Matching our own image name fails the moment the
+            // binary is renamed for a drop, which is exactly what happened on
+            // 20 Aug: edgevitals_v2.1.exe left vitals_* empty and put the
+            // agent in its own discovery log.
+            pids.push_back(selfPid);
+            for (const auto& pi : all)
+                if (pi.pid == selfPid) threadsByPid[selfPid] = pi.threads;
+        }
+        for (const auto& pi : all) {
+            if (tp.self && pi.pid == selfPid) continue;
+            for (const auto& want : tp.exe) {
+                if (pi.exeName == toLower(want)) {
+                    pids.push_back(pi.pid);
+                    threadsByPid[pi.pid] = pi.threads;
+                    break;
+                }
+            }
+        }
+
+        auto& slots = bound_[tp.role];
+
+        // Drop instances that have exited. Closing the handle here is what
+        // keeps the cache from leaking one handle per short-lived Piper run --
+        // which over a week of an ATM speaking is thousands.
+        slots.erase(std::remove_if(slots.begin(), slots.end(),
+                                   [&](Tracked& t) {
+                                       const bool gone = std::find(pids.begin(), pids.end(),
+                                                                   t.pid) == pids.end();
+                                       if (gone) closeHandle(t);
+                                       return gone;
+                                   }),
+                    slots.end());
+
+        for (unsigned long pid : pids) {
+            auto it = std::find_if(slots.begin(), slots.end(),
+                                   [&](const Tracked& t) { return t.pid == pid; });
+            if (it != slots.end()) {
+                it->threads = threadsByPid[pid];
+                continue;
+            }
+            Tracked t;
+            t.pid = pid;
+            t.gui = tp.gui;
+            t.threads = threadsByPid[pid];
+            slots.push_back(t);
+        }
+    }
+}
+
+bool ProcessSampler::openIfNeeded(Tracked& t) {
+    if (t.handle) return true;
+    // GetGuiResources needs PROCESS_QUERY_INFORMATION, so try that first --
+    // but fall back to LIMITED, which is granted far more often and is
+    // enough for times, memory and IO. Losing GDI counts is much better
+    // than losing the process entirely.
+    HANDLE h = nullptr;
+    t.fullAccess = false;
+    if (t.gui) {
+        h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, t.pid);
+        if (h) t.fullAccess = true;
+    }
+    if (!h) h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, t.pid);
+    if (!h) return false;
+    t.handle = h;
+    t.primed = false;  // counters restart against a fresh handle
+    t.createTime = 0;
+    return true;
+}
+
+bool ProcessSampler::isAlive(const Tracked& t) const {
+    if (!t.handle) return false;
+    // WaitForSingleObject rather than GetExitCodeProcess: a process that exits
+    // with code 259 is indistinguishable from a running one under
+    // STILL_ACTIVE, and that is the same class of bug as the one this fixes.
+    // Costs a SYNCHRONIZE right on the handle and roughly a microsecond.
+    const DWORD r = WaitForSingleObject(static_cast<HANDLE>(t.handle), 0);
+    if (r == WAIT_OBJECT_0) return false;      // signalled == exited
+    if (r == WAIT_TIMEOUT) return true;        // still running
+    // WAIT_FAILED means the handle lacks SYNCHRONIZE (a process we could only
+    // open with LIMITED rights on an older OS). Fall back rather than
+    // declaring a live process dead.
+    DWORD code = 0;
+    if (GetExitCodeProcess(static_cast<HANDLE>(t.handle), &code))
+        return code == STILL_ACTIVE;
+    return false;
+}
+
+const char* ProcessSampler::priorityName(void* handle) {
+    if (!handle) return "";
+    const DWORD p = GetPriorityClass(static_cast<HANDLE>(handle));
+    switch (p) {
+        case IDLE_PRIORITY_CLASS:         return "idle";
+        case BELOW_NORMAL_PRIORITY_CLASS: return "below";
+        case NORMAL_PRIORITY_CLASS:       return "normal";
+        case ABOVE_NORMAL_PRIORITY_CLASS: return "above";
+        case HIGH_PRIORITY_CLASS:         return "high";
+        case REALTIME_PRIORITY_CLASS:     return "realtime";
+        default:                          return "";   // 0 == call failed
+    }
+}
+
+void ProcessSampler::resetCounters(Tracked& t) {
+    t.lastKernel100ns = 0;
+    t.lastUser100ns = 0;
+    t.lastReadBytes = 0;
+    t.lastWriteBytes = 0;
+    t.lastReadOps = 0;
+    t.lastWriteOps = 0;
+    t.lastPageFaults = 0;
+    t.cpuSeconds = 0.0;
+    t.openFails = 0;
+    t.retryAtTick = 0;
+    t.primed = false;
+}
+
+bool ProcessSampler::sampleOne(Tracked& t, std::uint64_t elapsedNs, ProcSample& out) {
+    // Backoff: after repeated failures, stop retrying every tick. Doubles from
+    // 2 ticks to a 30-tick ceiling (5 minutes at the standing rate), so a role
+    // that is simply not installed costs one open attempt per 5 minutes rather
+    // than one per 10 seconds. Enumeration still rebinds it the moment it
+    // appears, so nothing is missed -- only the pointless retries go away.
+    if (!t.handle && t.openFails > 0 && tick_ < t.retryAtTick) {
+        out.note = "not running";
+        return false;
+    }
+    if (!openIfNeeded(t)) {
+        int delay = 2;
+        for (int k = 1; k < t.openFails && delay < 30; ++k) delay *= 2;
+        if (delay > 30) delay = 30;
+        ++t.openFails;
+        t.retryAtTick = tick_ + delay;
+        out.note = "open failed";
+        return false;
+    }
+    t.openFails = 0;
+
+    // Liveness is checked EVERY sample, not every enumeration. The old
+    // gone-detection tested membership of the enumerated PID list, which
+    // refreshes every 6th tick -- so a dead process reported zeros for up to
+    // four ticks and looked like a running application using no memory.
+    if (!isAlive(t)) {
+        closeHandle(t);
+        resetCounters(t);
+        out.note = "exited";
+        return false;                       // invalid => cells stay EMPTY
+    }
+
+    HANDLE h = static_cast<HANDLE>(t.handle);
+
+    FILETIME cre{}, ex{}, ker{}, usr{};
+    if (!GetProcessTimes(h, &cre, &ex, &ker, &usr)) {
+        closeHandle(t);
+        out.note = "GetProcessTimes failed";
+        return false;
+    }
+    const std::uint64_t k = toU64(ker), u = toU64(usr);
+
+    // Identity check. The creation time is already in hand from the call
+    // above -- it was previously discarded -- so this costs nothing but the
+    // comparison. A changed value means the PID was reused by a different
+    // process and every accumulated counter belongs to the previous one.
+    const std::uint64_t created = toU64(cre);
+    if (t.createTime != 0 && created != t.createTime) {
+        resetCounters(t);
+        out.note = "pid reused";
+    }
+    t.createTime = created;
+
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(h, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+        closeHandle(t);
+        out.note = "GetProcessMemoryInfo failed";
+        return false;
+    }
+
+    IO_COUNTERS io{};
+    const bool haveIo = GetProcessIoCounters(h, &io) != 0;
+
+    DWORD handles = 0;
+    GetProcessHandleCount(h, &handles);
+
+    out.pid = t.pid;
+    out.rssMb = static_cast<double>(pmc.WorkingSetSize) / kMb;
+    out.privateMb = static_cast<double>(pmc.PrivateUsage) / kMb;
+    out.peakRssMb = static_cast<double>(pmc.PeakWorkingSetSize) / kMb;
+    out.handles = handles;
+    out.threads = t.threads;
+    if (t.gui && t.fullAccess) {
+        // Qt applications leak these, and an ATM runs for weeks. A slow
+        // upward ramp here is the tell long before anything looks wrong.
+        out.gdiObjects = GetGuiResources(h, GR_GDIOBJECTS);
+        out.userObjects = GetGuiResources(h, GR_USEROBJECTS);
+    }
+
+    if (!t.primed) {
+        // First observation of this handle. Emit the levels, but no rates --
+        // a delta against zero would report a CPU spike that never happened.
+        t.lastKernel100ns = k;
+        t.lastUser100ns = u;
+        t.lastPageFaults = pmc.PageFaultCount;
+        if (haveIo) {
+            t.lastReadBytes = io.ReadTransferCount;
+            t.lastWriteBytes = io.WriteTransferCount;
+            t.lastReadOps = io.ReadOperationCount;
+            t.lastWriteOps = io.WriteOperationCount;
+        }
+        t.primed = true;
+        out.valid = true;
+        out.note = "primed";
+        return true;
+    }
+
+    const double elapsed100ns = static_cast<double>(elapsedNs) / 100.0;
+    if (elapsed100ns > 0.0) {
+        const double dk = static_cast<double>(k - t.lastKernel100ns);
+        const double du = static_cast<double>(u - t.lastUser100ns);
+        out.cpuPct = (dk + du) / elapsed100ns * 100.0;
+        // Kernel time separated on purpose: a high kernel fraction points at
+        // IO or driver work (camera, audio, XFS), a high user fraction at our
+        // own code. They call for opposite fixes and the combined number hides
+        // which one you are looking at.
+        out.cpuKernelPct = dk / elapsed100ns * 100.0;
+        // Accumulate the same deltas as seconds. 100 ns units -> seconds.
+        t.cpuSeconds += (dk + du) / 1.0e7;
+    }
+    out.cpuSeconds = t.cpuSeconds;
+    out.priority = priorityName(t.handle);
+
+    out.pageFaultDelta = static_cast<double>(pmc.PageFaultCount - t.lastPageFaults);
+
+    if (haveIo) {
+        const double secs = static_cast<double>(elapsedNs) / 1e9;
+        if (secs > 0.0) {
+            out.ioReadMbs = static_cast<double>(io.ReadTransferCount - t.lastReadBytes) / kMb / secs;
+            out.ioWriteMbs = static_cast<double>(io.WriteTransferCount - t.lastWriteBytes) / kMb / secs;
+            out.ioReadOps = static_cast<double>(io.ReadOperationCount - t.lastReadOps) / secs;
+            out.ioWriteOps = static_cast<double>(io.WriteOperationCount - t.lastWriteOps) / secs;
+        }
+        t.lastReadBytes = io.ReadTransferCount;
+        t.lastWriteBytes = io.WriteTransferCount;
+        t.lastReadOps = io.ReadOperationCount;
+        t.lastWriteOps = io.WriteOperationCount;
+    }
+
+    t.lastKernel100ns = k;
+    t.lastUser100ns = u;
+    t.lastPageFaults = pmc.PageFaultCount;
+
+    out.valid = true;
+    return true;
+}
+
+std::unordered_map<std::string, ProcSample> ProcessSampler::sampleAll(std::uint64_t elapsedNs) {
+    std::unordered_map<std::string, ProcSample> out;
+
+    for (auto& kv : bound_) {
+        ProcSample agg;
+        int live = 0;
+        std::string firstNote;
+
+        for (auto& t : kv.second) {
+            ProcSample s;
+            if (!sampleOne(t, elapsedNs, s)) {
+                if (firstNote.empty()) firstNote = s.note;
+                continue;
+            }
+            ++live;
+            // Aggregate across instances of a role. Rates and memory sum;
+            // PID reports the first, which is what a human wants to see.
+            if (live == 1) agg.pid = s.pid;
+            agg.cpuPct += s.cpuPct;
+            agg.cpuKernelPct += s.cpuKernelPct;
+            agg.rssMb += s.rssMb;
+            agg.privateMb += s.privateMb;
+            agg.peakRssMb = (std::max)(agg.peakRssMb, s.peakRssMb);
+            agg.pageFaultDelta += s.pageFaultDelta;
+            agg.handles += s.handles;
+            agg.threads += s.threads;
+            agg.gdiObjects += s.gdiObjects;
+            agg.userObjects += s.userObjects;
+            agg.ioReadMbs += s.ioReadMbs;
+            agg.ioWriteMbs += s.ioWriteMbs;
+            agg.ioReadOps += s.ioReadOps;
+            agg.ioWriteOps += s.ioWriteOps;
+            // cpuSeconds SUMS across instances -- total processor time for the
+            // role, matching how memory and CPU rate are aggregated.
+            agg.cpuSeconds += s.cpuSeconds;
+            // priority takes the FIRST live instance. Summing a class makes no
+            // sense, and the instances of one role are started the same way.
+            // Missing this pair is what left cpu_seconds reading 0.0 and
+            // priority empty for the whole GFF event: sampleOne filled them in
+            // and the aggregation dropped them on the floor, so the row carried
+            // a default-constructed zero rather than an honest empty.
+            if (live == 1) agg.priority = s.priority;
+            if (s.note == "primed" && firstNote.empty()) firstNote = "primed";
+        }
+
+        // valid stays false when nothing is running. The row then carries
+        // EMPTY cells, so "not licensed" and "idle" never both read as 0.
+        agg.valid = live > 0;
+        agg.note = firstNote;
+        out[kv.first] = agg;
+    }
+    return out;
+}
+
+size_t ProcessSampler::liveCount(const std::string& role) const {
+    auto it = bound_.find(role);
+    return it == bound_.end() ? 0 : it->second.size();
+}
+
+}  // namespace ev
+***********
+Row.cpp
+#include "edgevitals/Row.h"
+
+#include <cmath>
+#include <cstdio>
+
+namespace ev {
+
+std::string csvEscape(const std::string& v) {
+    bool needs = false;
+    for (char c : v) {
+        if (c == ',' || c == '"' || c == '\n' || c == '\r') { needs = true; break; }
+    }
+    if (!needs) return v;
+    std::string out;
+    out.reserve(v.size() + 8);
+    out.push_back('"');
+    for (char c : v) {
+        if (c == '"') out.push_back('"');
+        out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+}
+
+std::string Cell::toCsv(int precision) const {
+    switch (kind_) {
+        case Kind::Empty:
+            return std::string();
+        case Kind::Text:
+            return csvEscape(txt_);
+        case Kind::Number: {
+            // NaN and inf are written as empty rather than "nan"/"inf". A
+            // spreadsheet reading "nan" produces a text column and silently
+            // breaks every formula below it.
+            if (!std::isfinite(num_)) return std::string();
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), "%.*f", precision, num_);
+            std::string s(buf);
+            // Trim a pointless fractional tail: 12.00 -> 12, 12.50 -> 12.5
+            if (s.find('.') != std::string::npos) {
+                size_t end = s.size();
+                while (end > 0 && s[end - 1] == '0') --end;
+                if (end > 0 && s[end - 1] == '.') --end;
+                s.resize(end);
+            }
+            if (s == "-0") s = "0";
+            return s;
+        }
+    }
+    return std::string();
+}
+
+size_t Schema::add(const std::string& name, int precision) {
+    if (frozen_) return npos;
+    auto it = index_.find(name);
+    if (it != index_.end()) return it->second;
+    size_t i = names_.size();
+    names_.push_back(name);
+    precision_.push_back(precision);
+    index_[name] = i;
+    return i;
+}
+
+size_t Schema::indexOf(const std::string& name) const {
+    auto it = index_.find(name);
+    return it == index_.end() ? npos : it->second;
+}
+
+std::string Schema::headerCsv() const {
+    std::string out;
+    for (size_t i = 0; i < names_.size(); ++i) {
+        if (i) out.push_back(',');
+        out += csvEscape(names_[i]);
+    }
+    return out;
+}
+
+bool Row::setNumber(const std::string& name, double v) {
+    size_t i = schema_->indexOf(name);
+    if (i == Schema::npos) return false;
+    setNumber(i, v);
+    return true;
+}
+
+bool Row::setText(const std::string& name, std::string v) {
+    size_t i = schema_->indexOf(name);
+    if (i == Schema::npos) return false;
+    setText(i, std::move(v));
+    return true;
+}
+
+std::string Row::toCsv() const {
+    std::string out;
+    out.reserve(cells_.size() * 8);
+    for (size_t i = 0; i < cells_.size(); ++i) {
+        if (i) out.push_back(',');
+        out += cells_[i].toCsv(schema_->precision(i));
+    }
+    return out;
+}
+
+}  // namespace ev
+***********
+SystemSampler.cpp
+#include "edgevitals/SystemSampler.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace fs = std::filesystem;
+
+namespace ev {
+namespace {
+
+std::string toLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::uint64_t toU64(const FILETIME& ft) {
+    ULARGE_INTEGER u;
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    return u.QuadPart;
+}
+
+constexpr double kMb = 1024.0 * 1024.0;
+
+}  // namespace
+
+std::uint64_t monotonicNs() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+void nowLocal(std::string& iso, Date& date) {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03d", st.wYear, st.wMonth,
+                  st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    iso = buf;
+    date.y = st.wYear;
+    date.m = st.wMonth;
+    date.d = st.wDay;
+}
+
+SystemSampler::SystemSampler() {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    cores_ = si.dwNumberOfProcessors > 0 ? static_cast<int>(si.dwNumberOfProcessors) : 1;
+}
+
+SystemSample SystemSampler::sample(const std::string& diskPathHint) {
+    SystemSample s;
+    s.cores = cores_;
+
+    FILETIME idle{}, kern{}, user{};
+    if (GetSystemTimes(&idle, &kern, &user)) {
+        const std::uint64_t i = toU64(idle), k = toU64(kern), u = toU64(user);
+        if (primed_) {
+            // GetSystemTimes folds idle INTO kernel, so busy is
+            // (kernel - idle) + user, not kernel + user. Getting this wrong
+            // reports an idle machine as ~100% busy.
+            const double di = static_cast<double>(i - lastIdle_);
+            const double dk = static_cast<double>(k - lastKernel_);
+            const double du = static_cast<double>(u - lastUser_);
+            const double total = dk + du;
+            if (total > 0.0) s.cpuPct = (total - di) / total * 100.0;
+            if (s.cpuPct < 0.0) s.cpuPct = 0.0;
+        }
+        lastIdle_ = i;
+        lastKernel_ = k;
+        lastUser_ = u;
+        primed_ = true;
+    }
+
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    if (GlobalMemoryStatusEx(&ms)) {
+        s.availMb = static_cast<double>(ms.ullAvailPhys) / kMb;
+        s.totalMb = static_cast<double>(ms.ullTotalPhys) / kMb;
+        const double totalCommit = static_cast<double>(ms.ullTotalPageFile);
+        const double availCommit = static_cast<double>(ms.ullAvailPageFile);
+        if (totalCommit > 0.0) s.commitPct = (totalCommit - availCommit) / totalCommit * 100.0;
+    }
+
+    ULARGE_INTEGER freeAvail{}, total{}, freeTotal{};
+    std::string dir = diskPathHint.empty() ? std::string(".") : diskPathHint;
+    if (GetDiskFreeSpaceExA(dir.c_str(), &freeAvail, &total, &freeTotal))
+        s.diskFreeMb = static_cast<double>(freeAvail.QuadPart) / kMb;
+
+    return s;
+}
+
+double Win32DiskSpace::freeMbAt(const std::string& dir) {
+    ULARGE_INTEGER freeAvail{}, total{}, freeTotal{};
+    // The directory may not exist yet on first run; fall back to the volume
+    // the process is running from rather than reporting a scary zero.
+    std::string probe = dir;
+    std::error_code ec;
+    if (!fs::exists(probe, ec)) probe = ".";
+    if (!GetDiskFreeSpaceExA(probe.c_str(), &freeAvail, &total, &freeTotal)) return 0.0;
+    return static_cast<double>(freeAvail.QuadPart) / kMb;
+}
+
+// ── discovery ────────────────────────────────────────────────────────────
+DiscoveryLog::DiscoveryLog(std::string path, std::vector<std::string> systemAllowlist,
+                           std::vector<std::string> trackedExe)
+    : path_(std::move(path)) {
+    for (auto& a : systemAllowlist) allow_.insert(toLower(a));
+    for (auto& t : trackedExe) tracked_.insert(toLower(t));
+}
+
+void DiscoveryLog::loadExisting() {
+    std::ifstream in(path_);
+    if (!in) return;
+    std::string line;
+    bool first = true;
+    while (std::getline(in, line)) {
+        if (first) { first = false; continue; }  // header
+        // key is the 4th field (first_seen,name,path,key) -- but parsing CSV
+        // properly for one column is not worth it, so the key is written last
+        // and unquoted by construction.
+        const size_t last = line.find_last_of(',');
+        if (last != std::string::npos && last + 1 < line.size())
+            seen_.insert(line.substr(last + 1));
+    }
+}
+
+bool DiscoveryLog::isKnown(const ProcInfo& p) const {
+    // Our own PID, whatever the binary was renamed to for this drop. On
+    // 20 Aug edgevitals_v2.1.exe recorded itself as an unknown binary, which
+    // is noise in the one file a bank reviewer is most likely to open.
+    if (p.pid == GetCurrentProcessId()) return true;
+    if (allow_.count(p.exeName)) return true;
+    if (tracked_.count(p.exeName)) return true;
+    return false;
+}
+
+int DiscoveryLog::record(const std::vector<ProcInfo>& all, const std::string& nowIso) {
+    std::vector<const ProcInfo*> fresh;
+    for (const auto& p : all) {
+        if (p.pid == 0 || p.pid == 4) continue;  // System Idle / System
+        if (isKnown(p)) continue;
+        const std::string key = toLower(p.exePath.empty() ? p.exeName : p.exePath);
+        if (key.empty() || seen_.count(key)) continue;
+        seen_.insert(key);
+        fresh.push_back(&p);
+    }
+    if (fresh.empty()) return 0;
+
+    std::error_code ec;
+    const fs::path parent = fs::path(path_).parent_path();
+    if (!parent.empty()) fs::create_directories(parent, ec);
+
+    const bool existed = fs::exists(path_, ec) && fs::file_size(path_, ec) > 0;
+    std::ofstream out(path_, std::ios::app);
+    if (!out) return 0;
+    if (!existed) out << "first_seen,exe_name,exe_path,parent_pid,note,key\n";
+
+    for (const ProcInfo* p : fresh) {
+        // An unreadable path is recorded as a note rather than dropped.
+        // "Could not read PID 4312" is information; a missing row is not.
+        const std::string note = p->exePath.empty() ? "path unreadable" : "";
+        out << nowIso << ',' << csvEscape(p->exeName) << ',' << csvEscape(p->exePath) << ','
+            << p->parentPid << ',' << note << ','
+            << toLower(p->exePath.empty() ? p->exeName : p->exePath) << '\n';
+    }
+    return static_cast<int>(fresh.size());
+}
+
+}  // namespace ev
+***********
+main.cpp
+// EdgeVitals entry point.
+//
+//   edgevitals.exe --console            run in the foreground (lab mode)
+//   edgevitals.exe --install            register the service
+//   edgevitals.exe --uninstall          remove it
+//   edgevitals.exe --config <path>      config file (default config/edgevitals.json)
+//   edgevitals.exe --once               one tick to stdout, then exit (smoke test)
+//
+// With no arguments it assumes it was launched by the SCM. Running it from a
+// console with no arguments therefore does nothing visible, which is why
+// --console exists and why the usage text says so.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <thread>
+
+#include "edgevitals/Agent.h"
+#include "edgevitals/Config.h"
+
+using namespace ev;
+
+namespace {
+
+const char* kServiceName = "EdgeVitals";
+const char* kDisplayName = "BOSACH EdgeVitals telemetry agent";
+const char* kDescription =
+    "Samples CPU, memory and disk IO for ATM edge processes and writes day-rotated "
+    "telemetry for offline analysis. Observation only: it does not block, alert or enforce.";
+
+std::string g_runNote;
+std::string g_configPath = "config/edgevitals.json";
+Agent* g_agent = nullptr;
+SERVICE_STATUS g_status{};
+SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
+
+// Defined below, but called from serviceMain which appears first.
+void securitySelfCheck(const ev::Config& cfg, ev::ILogger& log);
+
+class ConsoleLogger : public ILogger {
+public:
+    void info(const std::string& m) override { std::fprintf(stderr, "[info ] %s\n", m.c_str()); }
+    void warn(const std::string& m) override { std::fprintf(stderr, "[warn ] %s\n", m.c_str()); }
+    void error(const std::string& m) override { std::fprintf(stderr, "[error] %s\n", m.c_str()); }
+};
+
+// The service has no console, so it reports through the event log. Registering
+// a message DLL for pretty formatting is more ceremony than this earns; the
+// raw string is readable in Event Viewer and that is what matters at 2am.
+class EventLogLogger : public ILogger {
+public:
+    EventLogLogger() { h_ = RegisterEventSourceA(nullptr, kServiceName); }
+    ~EventLogLogger() override { if (h_) DeregisterEventSource(h_); }
+    void info(const std::string& m) override { emit(EVENTLOG_INFORMATION_TYPE, m); }
+    void warn(const std::string& m) override { emit(EVENTLOG_WARNING_TYPE, m); }
+    void error(const std::string& m) override { emit(EVENTLOG_ERROR_TYPE, m); }
+
+private:
+    void emit(WORD type, const std::string& m) {
+        if (!h_) return;
+        const char* strings[1] = {m.c_str()};
+        ReportEventA(h_, type, 0, 0, nullptr, 1, 0, strings, nullptr);
+    }
+    HANDLE h_ = nullptr;
+};
+
+void setState(DWORD state, DWORD waitHintMs = 0) {
+    g_status.dwCurrentState = state;
+    g_status.dwWaitHint = waitHintMs;
+    if (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING)
+        g_status.dwCheckPoint++;
+    else
+        g_status.dwCheckPoint = 0;
+    if (g_statusHandle) SetServiceStatus(g_statusHandle, &g_status);
+}
+
+DWORD WINAPI handlerEx(DWORD control, DWORD, LPVOID, LPVOID) {
+    switch (control) {
+        case SERVICE_CONTROL_STOP:
+        case SERVICE_CONTROL_SHUTDOWN:
+            // 5 s hint: the tick loop wakes on an event, so shutdown is
+            // prompt, but the SCM should not kill us mid-write to the CSV.
+            setState(SERVICE_STOP_PENDING, 5000);
+            if (g_agent) g_agent->stop();
+            return NO_ERROR;
+        case SERVICE_CONTROL_INTERROGATE:
+            return NO_ERROR;
+        default:
+            return ERROR_CALL_NOT_IMPLEMENTED;
+    }
+}
+
+void WINAPI serviceMain(DWORD, LPSTR*) {
+    g_statusHandle = RegisterServiceCtrlHandlerExA(kServiceName, handlerEx, nullptr);
+    if (!g_statusHandle) return;
+
+    g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    g_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    g_status.dwWin32ExitCode = NO_ERROR;
+    setState(SERVICE_START_PENDING, 10000);
+
+    EventLogLogger log;
+
+    Config cfg = Config::defaults();
+    std::string err;
+    if (!cfg.load(g_configPath, err)) {
+        // A missing or bad config is a warning, not a failure to start. An ATM
+        // that loses telemetry because someone fat-fingered a JSON comma is
+        // worse than one running on defaults and saying so.
+        log.warn("config: " + err + " -- running on defaults");
+    }
+    cfg.runNote = g_runNote;
+    securitySelfCheck(cfg, log);
+
+    Agent agent(cfg, log);
+    g_agent = &agent;
+    if (!agent.start()) {
+        log.error("agent failed to start");
+        g_status.dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
+        setState(SERVICE_STOPPED);
+        return;
+    }
+
+    setState(SERVICE_RUNNING);
+    agent.run();
+    g_agent = nullptr;
+    setState(SERVICE_STOPPED);
+}
+
+// Reports posture at startup rather than assuming it. Every item here was
+// raised in the security review and cannot be fixed in code -- the agent can
+// only refuse to be quiet about them.
+void securitySelfCheck(const ev::Config& cfg, ev::ILogger& log) {
+    char exe[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, exe, sizeof(exe) - 1);
+    std::string p(exe);
+
+    if (cfg.ipcClientSid == "AU" || cfg.ipcClientSid == "WD") {
+        log.warn("security: ipc client_sid is '" + cfg.ipcClientSid +
+                 "' -- any authenticated local process may push telemetry. "
+                 "Narrow it to EdgeTerminal's account before production.");
+    }
+    if (cfg.ipcAllowSnapshot) {
+        log.warn("security: allow_snapshot is on -- any permitted client can read "
+                 "the full process inventory of this terminal.");
+    }
+
+    // Volume check. A service binary on a removable or secondary volume can be
+    // swapped and then runs as SYSTEM at next start.
+    if (p.size() > 2 && p[1] == ':') {
+        char root[4] = {p[0], ':', '\\', 0};
+        const UINT dt = GetDriveTypeA(root);
+        if (dt == DRIVE_REMOVABLE || dt == DRIVE_REMOTE) {
+            log.warn(std::string("security: running from a ") +
+                     (dt == DRIVE_REMOVABLE ? "removable" : "network") +
+                     " volume (" + root + ") -- the binary can be replaced. "
+                     "Move it to the system volume with an Administrators-only ACL.");
+        }
+        char win[MAX_PATH] = {0};
+        GetWindowsDirectoryA(win, sizeof(win) - 1);
+        if (win[0] && (p[0] | 32) != (win[0] | 32))
+            log.info(std::string("security: binary is on ") + root +
+                     ", not the system volume -- confirm its ACL is Administrators only.");
+    }
+
+    // Writable by ordinary users? Cheap probe: try to create a file in the exe
+    // directory while impersonating nothing. This is indicative, not an ACL
+    // audit -- as SYSTEM the write will usually succeed regardless.
+    log.info("security: verify the exe directory grants write to Administrators "
+             "and SYSTEM only, and that the binary is Authenticode signed. "
+             "Neither can be checked reliably from inside the process.");
+}
+
+std::string exePath() {
+    char buf[MAX_PATH * 2] = {0};
+    GetModuleFileNameA(nullptr, buf, sizeof(buf) - 1);
+    return buf;
+}
+
+int installService() {
+    SC_HANDLE scm = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+    if (!scm) {
+        std::fprintf(stderr, "OpenSCManager failed (%lu). Run from an elevated prompt.\n",
+                     GetLastError());
+        return 1;
+    }
+    // The binary path carries --config so the service does not depend on its
+    // working directory, which the SCM sets to system32.
+    const std::string bin = "\"" + exePath() + "\" --config \"" + g_configPath + "\"";
+    SC_HANDLE svc = CreateServiceA(scm, kServiceName, kDisplayName, SERVICE_ALL_ACCESS,
+                                   SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+                                   SERVICE_ERROR_NORMAL, bin.c_str(), nullptr, nullptr,
+                                   nullptr, nullptr, nullptr);
+    if (!svc) {
+        const DWORD e = GetLastError();
+        std::fprintf(stderr, e == ERROR_SERVICE_EXISTS ? "Service already installed.\n"
+                                                       : "CreateService failed (%lu).\n", e);
+        CloseServiceHandle(scm);
+        return 1;
+    }
+    SERVICE_DESCRIPTIONA desc{const_cast<LPSTR>(kDescription)};
+    ChangeServiceConfig2A(svc, SERVICE_CONFIG_DESCRIPTION, &desc);
+
+    // LocalSystem holds every privilege on the box. A telemetry agent needs
+    // almost none of them, and "runs as SYSTEM with full privileges" is the
+    // first thing a bank's hardening review will object to. Strip the token
+    // to what sampling actually requires.
+    //
+    // SeChangeNotifyPrivilege  - traverse directories to write the log
+    // SeCreateGlobalPrivilege  - the named pipe object
+    //
+    // Deliberately NOT requested: SeDebugPrivilege, SeTcbPrivilege,
+    // SeLoadDriverPrivilege, SeTakeOwnershipPrivilege, SeBackupPrivilege,
+    // SeRestorePrivilege. Querying PROCESS_QUERY_LIMITED_INFORMATION does not
+    // need SeDebug as SYSTEM; if a future protected-process read does, add it
+    // deliberately and record why.
+    {
+        static const char kPrivs[] =
+            "SeChangeNotifyPrivilege\0SeCreateGlobalPrivilege\0";
+        SERVICE_REQUIRED_PRIVILEGES_INFOA rp{};
+        rp.pmszRequiredPrivileges = const_cast<LPSTR>(kPrivs);
+        if (!ChangeServiceConfig2A(svc, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, &rp))
+            std::fprintf(stderr, "warning: could not restrict privileges (%lu)\n", GetLastError());
+    }
+
+    // Give the service its own SID and a write-restricted token, so a
+    // compromise of this process cannot write to objects that have not
+    // explicitly granted the service SID access.
+    {
+        SERVICE_SID_INFO sid{};
+        sid.dwServiceSidType = SERVICE_SID_TYPE_RESTRICTED;
+        if (!ChangeServiceConfig2A(svc, SERVICE_CONFIG_SERVICE_SID_INFO, &sid)) {
+            // Restricted needs the write-restricted token to reach the log
+            // directory and the pipe; fall back to an unrestricted service
+            // SID rather than leaving it at NONE.
+            sid.dwServiceSidType = SERVICE_SID_TYPE_UNRESTRICTED;
+            ChangeServiceConfig2A(svc, SERVICE_CONFIG_SERVICE_SID_INFO, &sid);
+            std::fprintf(stderr, "note: service SID set to UNRESTRICTED\n");
+        }
+    }
+
+    // Restart on failure. A telemetry agent that dies silently is worse than
+    // one that never ran, because the gap in the CSV looks like an idle period.
+    SC_ACTION actions[3];
+    actions[0] = {SC_ACTION_RESTART, 10000};
+    actions[1] = {SC_ACTION_RESTART, 30000};
+    actions[2] = {SC_ACTION_RESTART, 60000};
+    SERVICE_FAILURE_ACTIONSA fa{};
+    fa.dwResetPeriod = 86400;
+    fa.cActions = 3;
+    fa.lpsaActions = actions;
+    ChangeServiceConfig2A(svc, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
+
+    std::printf("Installed '%s'.\n  binary: %s\n  start:  net start %s\n", kServiceName,
+                bin.c_str(), kServiceName);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return 0;
+}
+
+int uninstallService() {
+    SC_HANDLE scm = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        std::fprintf(stderr, "OpenSCManager failed (%lu). Run elevated.\n", GetLastError());
+        return 1;
+    }
+    SC_HANDLE svc = OpenServiceA(scm, kServiceName, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+    if (!svc) {
+        std::fprintf(stderr, "Service not installed.\n");
+        CloseServiceHandle(scm);
+        return 1;
+    }
+    SERVICE_STATUS st{};
+    ControlService(svc, SERVICE_CONTROL_STOP, &st);
+    const bool ok = DeleteService(svc) != 0;
+    std::printf(ok ? "Removed '%s'.\n" : "DeleteService failed.\n", kServiceName);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return ok ? 0 : 1;
+}
+
+BOOL WINAPI ctrlHandler(DWORD) {
+    if (g_agent) g_agent->stop();
+    return TRUE;
+}
+
+int runConsole(bool once) {
+    ConsoleLogger log;
+    Config cfg = Config::defaults();
+    std::string err;
+    if (!cfg.load(g_configPath, err)) log.warn("config: " + err + " -- running on defaults");
+    cfg.runNote = g_runNote;
+    if (once) cfg.intervalMs = 1000;
+    securitySelfCheck(cfg, log);
+
+    Agent agent(cfg, log);
+    g_agent = &agent;
+    SetConsoleCtrlHandler(ctrlHandler, TRUE);
+    if (!agent.start()) return 1;
+
+    if (once) {
+        // Two ticks, not one: the first primes the CPU and IO counters and
+        // legitimately has no deltas to report. Reporting it as a result
+        // would show a machine at 0% and look like a bug.
+        std::fprintf(stderr, "[info ] --once: priming, then one measured tick\n");
+        std::thread([&] {
+            Sleep(2500);
+            agent.stop();
+        }).detach();
+    }
+    agent.run();
+    g_agent = nullptr;
+    return 0;
+}
+
+void usage() {
+    std::printf(
+        "EdgeVitals -- BOSACH ATM telemetry agent\n\n"
+        "  --console            run in the foreground (Ctrl+C to stop)\n"
+        "  --once               prime + one measured tick, then exit\n"
+        "  --install            register as a Windows service\n"
+        "  --uninstall          remove the service\n"
+        "  --config <path>      config file (default config/edgevitals.json)\n"
+        "  --note <text>        label this run in the CSV (what the terminal was doing)\n"
+        "  --help               this text\n\n"
+        "With no arguments it expects to be started by the Service Control Manager.\n");
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    bool console = false, once = false, install = false, uninstall = false, help = false;
+
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        if (!std::strcmp(a, "--console")) console = true;
+        else if (!std::strcmp(a, "--once")) { once = true; console = true; }
+        else if (!std::strcmp(a, "--install")) install = true;
+        else if (!std::strcmp(a, "--uninstall")) uninstall = true;
+        else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) help = true;
+        else if (!std::strcmp(a, "--config") && i + 1 < argc) g_configPath = argv[++i];
+        else if (!std::strcmp(a, "--note") && i + 1 < argc) g_runNote = argv[++i];
+        else { std::fprintf(stderr, "unknown argument: %s\n\n", a); usage(); return 2; }
+    }
+
+    if (help) { usage(); return 0; }
+    if (install) return installService();
+    if (uninstall) return uninstallService();
+    if (console) return runConsole(once);
+
+    SERVICE_TABLE_ENTRYA table[] = {
+        {const_cast<LPSTR>(kServiceName), serviceMain},
+        {nullptr, nullptr},
+    };
+    if (!StartServiceCtrlDispatcherA(table)) {
+        if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+            std::fprintf(stderr, "Not started by the SCM.\n\n");
+            usage();
+            return 2;
+        }
+        return 1;
+    }
+    return 0;
+}
+***********

@@ -1,0 +1,902 @@
+Agent.h
+// Orchestration: builds the schema, runs the tick loop, writes rows.
+//
+// Everything platform-specific lives behind ProcessSampler, SystemSampler and
+// IpcServer. Agent itself only decides WHAT to record and WHEN.
+#pragma once
+#include <atomic>
+#include <memory>
+#include <string>
+
+#include "edgevitals/Config.h"
+#include "edgevitals/CsvSink.h"
+#include "edgevitals/IpcServer.h"
+#include "edgevitals/ProcessSampler.h"
+#include "edgevitals/Row.h"
+#include "edgevitals/SystemSampler.h"
+
+namespace ev {
+
+// Where the agent reports its own state. The service writes to the event log,
+// the console build writes to stderr; Agent does not care which.
+class ILogger {
+public:
+    virtual ~ILogger() = default;
+    virtual void info(const std::string& msg) = 0;
+    virtual void warn(const std::string& msg) = 0;
+    virtual void error(const std::string& msg) = 0;
+};
+
+class Agent {
+public:
+    Agent(Config cfg, ILogger& log);
+    ~Agent();
+
+    bool start();
+    // Blocks until stop(). Safe to call from a service worker thread.
+    void run();
+    void stop();
+
+    const Schema& schema() const { return schema_; }
+    long long ticks() const { return tick_; }
+
+private:
+    void buildSchema();
+    void doTick();
+    std::string snapshotJson(const Row& r) const;
+
+    Config cfg_;
+    ILogger& log_;
+    Schema schema_;
+
+    std::unique_ptr<ProcessSampler> proc_;
+    std::unique_ptr<SystemSampler> sys_;
+    std::unique_ptr<CsvSink> sink_;
+    std::unique_ptr<IpcServer> ipc_;
+    std::unique_ptr<DiscoveryLog> discovery_;
+
+    std::atomic<bool> running_{false};
+    void* wakeEvent_ = nullptr;  // HANDLE, so stop() interrupts the wait
+
+    long long tick_ = 0;
+    std::uint64_t lastTickNs_ = 0;
+    std::uint64_t startNs_ = 0;
+    // Distinguishes two runs inside one day file. Without it, seq restarts at
+    // 0 on every start and a day with two runs carries duplicate sequence
+    // numbers -- so anything that differences or sorts on seq silently
+    // interleaves two unrelated series.
+    std::string runId_;
+    // Eight hex characters over the applied config. Two files with different
+    // hashes were produced under different rules, which is worth knowing
+    // before comparing their numbers.
+    std::string cfgHash_;
+    double lastEnumCostMs_ = 0.0;
+    Date lastPurgeDate_;
+    bool warnedSuppressed_ = false;
+
+    // Cached column indices. Looked up once at startup so the hot path does
+    // no string hashing -- the whole point is that sampling costs under 2 ms.
+    struct Cols {
+        size_t ts = Schema::npos, seq = Schema::npos, uptime = Schema::npos;
+        size_t runId = Schema::npos, agentVer = Schema::npos;
+        size_t runNote = Schema::npos, cfgHash = Schema::npos;
+        size_t tickSkew = Schema::npos;
+        size_t sampleCost = Schema::npos, enumCost = Schema::npos;
+        size_t sysCpu = Schema::npos, sysAvail = Schema::npos, sysCommit = Schema::npos;
+        size_t sysTotal = Schema::npos;
+        size_t diskFree = Schema::npos, cores = Schema::npos;
+        size_t unknownNew = Schema::npos, budgetBreaches = Schema::npos;
+        // Contention accounting. txn/bg are this tick; contention is the
+        // running total of ticks where both conditions held.
+        size_t txnCpu = Schema::npos, bgCpu = Schema::npos, contention = Schema::npos;
+    } col_;
+
+    struct RoleCols {
+        size_t pid, cpu, cpuKernel, rss, priv, peak, faults, handles, threads;
+        size_t ioRead, ioWrite, ioReadOps, ioWriteOps;
+        size_t gdi = Schema::npos, user = Schema::npos;
+        size_t cpuSeconds = Schema::npos, priority = Schema::npos;
+    };
+    std::vector<std::pair<std::string, RoleCols>> roleCols_;
+    // Cumulative ticks in which a background-tier role held CPU while a
+    // transaction-tier role was active. Survives across ticks, resets never --
+    // the point is the running count over a session.
+    long long contentionTicks_ = 0;
+
+    // Summed across every live role in the group. NOT a copy of the per-role
+    // columns: only quantities that add correctly are here.
+    //
+    // private_mb sums because private bytes are private by definition.
+    // rss_mb deliberately does NOT appear -- working sets include shared
+    // pages, so summing them counts every shared DLL once per process and
+    // would be the one arithmetically wrong number in the file. Sum
+    // private_mb for memory; use the per-role rss columns if you need
+    // resident figures.
+    struct GroupCols {
+        size_t priv, cpu, cpuKernel, handles, threads, cpuSeconds, live;
+    };
+    std::vector<std::pair<std::string, GroupCols>> groupCols_;
+};
+
+}  // namespace ev
+***********
+Archive.h
+// Minimal ZIP writer: CRC32 + raw DEFLATE + the ZIP container.
+//
+// WHY THIS EXISTS RATHER THAN A LIBRARY
+// The Win7 SP1 floor (_WIN32_WINNT=0x0601) rules out the Windows Compression
+// API, which is Windows 8 and later. Zero third-party dependency rules out
+// zlib. Shelling out to makecab or PowerShell would put a process spawn on a
+// locked-down terminal for the sake of saving disk. So the compressor is here,
+// in the platform-independent core, where it is testable on any host and
+// verifiable against a reference implementation.
+//
+// SCOPE: compression only. There is no inflate path -- nothing in EdgeVitals
+// ever reads an archive back. Anything that opens one (Explorer, 7-Zip,
+// Python's zipfile) already has a decompressor.
+//
+// The DEFLATE encoder emits fixed-Huffman blocks with LZ77 matching. Dynamic
+// Huffman would gain roughly another 25-30% on this data and costs several
+// hundred more lines of table construction; fixed already turns a 7 MB
+// telemetry CSV into well under 1 MB, and the marginal megabyte is not worth
+// the additional surface for a bug that produces a corrupt archive.
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace ev {
+
+std::uint32_t crc32Of(const std::uint8_t* data, std::size_t n,
+                      std::uint32_t seed = 0);
+
+// Raw DEFLATE stream (RFC 1951). No zlib or gzip wrapper -- ZIP method 8
+// wants the bare stream.
+std::vector<std::uint8_t> deflateRaw(const std::uint8_t* data, std::size_t n);
+
+// One entry in a ZIP file.
+struct ZipEntry {
+    std::string name;                 // stored path, forward slashes
+    std::vector<std::uint8_t> data;   // uncompressed content
+    // DOS timestamp fields. Zero is legal and renders as 1980-01-01, which is
+    // worse than useless when an analyst is looking for a date -- so the
+    // caller passes the file's own date.
+    int year = 1980, month = 1, day = 1, hour = 0, minute = 0, second = 0;
+};
+
+// Builds a complete ZIP archive in memory. Single-threaded, no temp files.
+// Entries are stored with method 8 unless deflate fails to shrink them, in
+// which case that entry falls back to method 0 -- a stored entry is still a
+// valid archive, and refusing to archive at all would be worse.
+std::vector<std::uint8_t> buildZip(const std::vector<ZipEntry>& entries);
+
+}  // namespace ev
+***********
+Config.h
+#pragma once
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace ev {
+
+// Written into every row. A CSV read months later must be able to say which
+// build produced it -- a schema change between drops silently redefines
+// columns otherwise, and the file carries no other clue.
+constexpr const char* kAgentVersion = "0.9.1-buildfix";
+
+// One process EdgeVitals is asked to track by name. Role becomes the column
+// prefix, so it must be a valid identifier fragment: ui_cpu_pct, vision_rss_mb.
+struct TrackedProcess {
+    std::string role;               // "ui", "vision", "nats", ...
+    std::vector<std::string> exe;   // matched case-insensitively on file name
+    std::string label;              // human-readable, for the discovery log
+    double ramBudgetMb = 0.0;       // 0 = no budget
+    double cpuBudgetPct = 0.0;      // % of one core; 0 = no budget
+    // GDI/USER object counts are only meaningful for a process with a
+    // window. Adding them to all 13 roles would be 26 permanently-empty
+    // columns, so they are opt-in.
+    bool gui = false;
+    // Roles sharing a group get a summed rollup column set. Empty means the
+    // role is in no group and contributes to no total. A group exists so the
+    // question "what does BOSACH software cost on this terminal" is answered
+    // by reading one column rather than by summing eleven correctly.
+    std::string group;
+    // Binds to this process by PID, ignoring exe entirely. The 20 Aug run
+    // shipped as edgevitals_v2.1.exe, did not match "edgevitals.exe", and so
+    // recorded ITSELF in the discovery log while leaving vitals_* empty --
+    // the agent could not measure its own cost. A name is a rename away from
+    // wrong; the PID is not.
+    bool self = false;
+    // Scheduling tier. "transaction" is the MVS-to-Switch path and anything
+    // it depends on; "background" is work that must yield to it -- content,
+    // campaign, vision. Empty means untiered and excluded from contention
+    // accounting. This is a LABEL: EdgeVitals reports contention, it does not
+    // enforce priority. Enforcement is a CREATE_SUSPENDED priority class or a
+    // Job Object CPU cap at launch, and it belongs to whatever starts these
+    // processes.
+    std::string tier;
+};
+
+struct Config {
+    // ── sampling ────────────────────────────────────────────────────────
+    int intervalMs = 10000;         // 10 s standing rate
+    int enumerateEveryTicks = 6;    // full process enumeration every 60 s.
+                                    // Process churn is not a 10 s phenomenon
+                                    // and enumeration is the expensive part.
+
+    // ── output ──────────────────────────────────────────────────────────
+    std::string logDir = "logs";
+    std::string filePrefix = "telemetry";
+    int retentionDays = 30;
+    // Files older than this are compressed to <name>.csv.zip and the raw .csv
+    // removed. Only the most recent archiveAfterDays remain readable without
+    // unzipping, which is what a field engineer actually needs; everything
+    // behind that is for retrospective analysis and can afford a decompress.
+    // 0 disables archiving entirely and keeps every file raw until purge.
+    int archiveAfterDays = 7;
+    int archiveMaxMb = 64;   // refuse to compress a file larger than this
+    // A transaction-tier role above this counts as "the terminal is busy
+    // transacting"; a background-tier role above its own limit at the same
+    // moment counts as contention. Percent of ONE core, matching the budgets.
+    double txnActivePct = 5.0;
+    double bgLimitPct = 5.0;
+    // Stop writing below this and say so once. A telemetry log that fills the
+    // disk and takes the terminal out of service is a self-inflicted outage.
+    double diskFloorMb = 500.0;
+    bool flushEveryTick = true;
+
+    // ── discovery ───────────────────────────────────────────────────────
+    bool discoverUnknown = true;
+    std::string discoveryFile = "unknown-processes.csv";
+    // Never flagged as unknown. Not a security allowlist -- purely noise
+    // suppression for the OS surface. Enforcement belongs in EdgeBastion.
+    std::vector<std::string> systemAllowlist;
+
+    // ── IPC ─────────────────────────────────────────────────────────────
+    bool ipcEnabled = true;
+    std::string pipeName = "\\\\.\\pipe\\edgevitals";
+    // SID allowed to push columns, in SDDL form. Default S-1-5-11
+    // (Authenticated Users) is the loosest thing that still works and should
+    // be narrowed to the account EdgeTerminal runs as before production.
+    // Free text from --note, written to every row. Every diagnosis so far has
+    // stalled on "what was the terminal doing during this run" -- whether the
+    // camera was on, whether a probe was looping. A CSV that cannot answer that
+    // needs a human who remembers, and by the next week nobody does.
+    std::string runNote;
+    // Path the config was loaded from, so the hash covers what was actually
+    // applied rather than whatever happens to sit next to the exe.
+    std::string sourcePath;
+    std::string ipcClientSid = "AU";
+    // Concurrent pipe clients. Unbounded lets one local process exhaust
+    // threads; the real client count is 1.
+    int ipcMaxClients = 4;
+    // The snapshot command returns the whole current row. That is a complete
+    // process inventory of the terminal, so it is off unless asked for.
+    bool ipcAllowSnapshot = false;
+    // Columns clients may push. Declared here so the schema is fixed before
+    // the first row is written -- a column appearing mid-file would
+    // desynchronise every row already on disk.
+    struct ExtraColumn {
+        std::string name;
+        int precision = 2;
+        bool text = false;
+    };
+    std::vector<ExtraColumn> extraColumns;
+
+    // ── tracked processes ───────────────────────────────────────────────
+    std::vector<TrackedProcess> tracked;
+
+    // Loads from path. On any failure returns false with err set and leaves
+    // *this at defaults -- a bad config must not produce a half-applied one.
+    bool load(const std::string& path, std::string& err);
+
+    // Defaults matching the BOSACH edge portfolio.
+    static Config defaults();
+};
+
+}  // namespace ev
+***********
+CsvSink.h
+// Day-rotated CSV writer.
+//
+// Platform-independent by design: the one OS-specific thing it needs -- free
+// space on the log volume -- comes in through IDiskSpace. That keeps rotation
+// and retention logic testable off-Windows, which is where their bugs live.
+#pragma once
+#include <cstdio>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "edgevitals/Row.h"
+
+namespace ev {
+
+struct Date {
+    int y = 0, m = 0, d = 0;
+    bool operator==(const Date& o) const { return y == o.y && m == o.m && d == o.d; }
+    bool operator!=(const Date& o) const { return !(*this == o); }
+    std::string iso() const;                       // 2026-07-31
+    static bool parseIso(const std::string& s, Date& out);
+    // Days since 1970-01-01. Only used for retention age, so the epoch is
+    // arbitrary -- what matters is that differences are correct.
+    long long serial() const;
+};
+
+class IDiskSpace {
+public:
+    virtual ~IDiskSpace() = default;
+    virtual double freeMbAt(const std::string& dir) = 0;
+};
+
+class CsvSink {
+public:
+    struct Options {
+        std::string dir = "logs";
+        std::string prefix = "telemetry";
+        int retentionDays = 30;
+        int archiveAfterDays = 7;      // 0 = never archive
+        // Refuse to compress a file larger than this. Compression peaks at
+        // roughly 3x the file size in transient memory, so an unbounded day
+        // file would blow the agent's own budget on a 4 GB terminal. An
+        // oversized file is left raw and reported, not silently skipped.
+        int archiveMaxMb = 64;
+        // Apply an explicit DACL to the log directory on creation. Telemetry
+        // is not cardholder data, but it does enumerate every process on the
+        // terminal including the security stack, which is reconnaissance.
+        // Inheriting whatever the exe was unpacked into is not a decision.
+        bool restrictLogAcl = true;
+        double diskFloorMb = 500.0;
+        bool flushEveryTick = true;
+    };
+
+    CsvSink(Options opts, const Schema& schema, std::shared_ptr<IDiskSpace> disk);
+    ~CsvSink();
+
+    CsvSink(const CsvSink&) = delete;
+    CsvSink& operator=(const CsvSink&) = delete;
+
+    // Writes one row, rotating first if the date changed. Returns false if
+    // the row was suppressed (disk floor) or the file could not be opened;
+    // lastError() explains which.
+    bool write(const Row& row, const Date& today);
+
+    // True while writing is suppressed by the disk floor.
+    bool suppressed() const { return suppressed_; }
+    const std::string& lastError() const { return lastError_; }
+    const std::string& currentPath() const { return path_; }
+
+    // Deletes prefix-YYYY-MM-DD.csv AND prefix-YYYY-MM-DD.csv.zip older than
+    // retentionDays. Returns how many were removed. Never touches a file it
+    // cannot date from its own name -- an unparseable name is somebody else's
+    // file. Permanent: fs::remove, no recycle bin, no tombstone.
+    int purgeOldFiles(const Date& today);
+
+    // SYSTEM and Administrators only, inheritable, protected from inherited
+    // ACEs. Best-effort: a failure is recorded in lastError() and does not
+    // stop telemetry, because losing the log is worse than a loose ACL.
+    // No-op off Windows so the core stays testable.
+    void applyLogDirAcl();
+
+    // Compresses prefix-YYYY-MM-DD.csv older than archiveAfterDays into
+    // prefix-YYYY-MM-DD.csv.zip and removes the raw file. Returns how many
+    // were archived.
+    //
+    // Ordering contract: the .zip is written to a .tmp name, fsync'd, renamed
+    // into place, and only then is the .csv deleted. A power cut at any point
+    // leaves either the original or a complete archive, never neither.
+    int archiveOldFiles(const Date& today);
+
+    // Total bytes currently held by this sink's own files (.csv + .csv.zip).
+    // Lets the agent report its own footprint rather than the operator
+    // discovering it.
+    long long bytesOnDisk() const;
+
+    double freeMb() const { return freeMb_; }
+
+private:
+    bool openFor(const Date& d);
+    void close();
+
+    Options opts_;
+    const Schema& schema_;
+    std::shared_ptr<IDiskSpace> disk_;
+    std::FILE* fp_ = nullptr;
+    Date openDate_;
+    std::string path_;
+    std::string lastError_;
+    bool suppressed_ = false;
+    double freeMb_ = 0.0;
+};
+
+}  // namespace ev
+***********
+IpcServer.h
+// Named-pipe server for metrics only the owning process can measure.
+//
+// EdgeVitals does not know what a "frame_p99_ms" is and should not have to --
+// EdgeTerminal knows. Clients push a one-line JSON object per tick; the agent
+// merges any key matching a configured extra column into the next row and
+// ignores the rest. New metrics therefore ship without touching this agent.
+//
+// Protocol, deliberately trivial so a client is ~40 lines:
+//   client -> {"role":"ui","state":"pin","frame_p99_ms":18.2}\n
+//   server -> {"ok":1}\n                     (ack, so a client can detect loss)
+//   client -> {"cmd":"snapshot"}\n
+//   server -> {"ts":"...","ui_cpu_pct":12.3,...}\n   (last row, for the panel)
+//
+// A client that never connects costs nothing. EdgeTerminal must start and run
+// normally with this agent absent, and vice versa -- they are separately
+// licensed and neither may become a dependency of the other.
+#pragma once
+#include <atomic>
+#include <map>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace ev {
+
+class IpcServer {
+public:
+    struct Value {
+        bool isText = false;
+        double num = 0.0;
+        std::string txt;
+    };
+
+    IpcServer(std::string pipeName, std::vector<std::string> acceptedKeys);
+    ~IpcServer();
+
+    IpcServer(const IpcServer&) = delete;
+    IpcServer& operator=(const IpcServer&) = delete;
+
+    bool start();
+    void stop();
+    bool running() const { return running_.load(); }
+    const std::string& lastError() const { return lastError_; }
+
+    // Takes everything pushed since the last call and clears the buffer.
+    // Drain-on-read: a client that stops pushing leaves its columns EMPTY
+    // rather than repeating a stale value forever.
+    std::map<std::string, Value> drain();
+
+    // Published for the snapshot command so a side panel and the CSV can
+    // never disagree -- the panel is a view of the row, not its own sample.
+    void publishSnapshot(std::string json);
+
+    int clientCount() const { return clients_.load(); }
+
+    // Must be called before start(). Defaults are the permissive ones, so a
+    // caller that forgets this gets a working but wide-open pipe -- which is
+    // why Agent sets it unconditionally rather than only when configured.
+    void setSecurity(std::string clientSid, int maxClients, bool allowSnapshot) {
+        if (!clientSid.empty()) clientSid_ = std::move(clientSid);
+        if (maxClients > 0) maxClients_ = maxClients;
+        allowSnapshot_ = allowSnapshot;
+    }
+
+private:
+    void listenLoop();
+    void serveClient(void* pipe);
+    void handleLine(const std::string& line, std::string& reply);
+
+    std::string pipeName_;
+    std::vector<std::string> accepted_;
+    std::string lastError_;
+
+    std::thread listener_;
+    std::atomic<bool> running_{false};
+    std::atomic<int> clients_{0};
+    std::string clientSid_ = "AU";   // SDDL form, from config
+    int maxClients_ = 4;
+    bool allowSnapshot_ = false;
+    void* stopEvent_ = nullptr;
+
+    std::mutex mu_;
+    std::map<std::string, Value> pending_;
+    std::string snapshot_;
+};
+
+}  // namespace ev
+***********
+Json.h
+// Minimal JSON reader.
+//
+// Deliberately not a general-purpose library: it parses the subset EdgeVitals
+// config needs (objects, arrays, strings, numbers, bools, null) plus // and
+// /* */ comments, and nothing else.
+//
+// Hand-rolled rather than vendored so the agent has ZERO external
+// dependencies. It installs as a Windows service on a locked-down ATM, and
+// every DLL it does not need is one fewer thing to justify to a bank.
+#pragma once
+#include <map>
+#include <string>
+#include <vector>
+
+namespace ev {
+
+class Json {
+public:
+    enum class Type { Null, Bool, Number, String, Array, Object };
+
+    Json() = default;
+
+    Type type() const { return type_; }
+    bool isNull() const { return type_ == Type::Null; }
+    bool isObject() const { return type_ == Type::Object; }
+    bool isArray() const { return type_ == Type::Array; }
+
+    // Accessors return the fallback when the node is absent or the wrong
+    // type. A malformed config degrades to defaults rather than throwing on a
+    // service that has no console to throw at.
+    bool asBool(bool fallback = false) const;
+    double asNumber(double fallback = 0.0) const;
+    long long asInt(long long fallback = 0) const;
+    std::string asString(const std::string& fallback = "") const;
+
+    const Json& operator[](const std::string& key) const;  // null if missing
+    const Json& operator[](size_t i) const;                // null if OOR
+
+    size_t size() const;
+    bool has(const std::string& key) const;
+    std::vector<std::string> keys() const;
+
+    // On failure returns false and fills err with "line N: message".
+    static bool parse(const std::string& text, Json& out, std::string& err);
+
+private:
+    Type type_ = Type::Null;
+    bool bool_ = false;
+    double num_ = 0.0;
+    std::string str_;
+    std::vector<Json> arr_;
+    std::map<std::string, Json> obj_;
+
+    friend class JsonParser;
+    static const Json kNull;
+};
+
+}  // namespace ev
+***********
+ProcessSampler.h
+// Per-process sampling, direct Win32.
+//
+// NOT WMI and NOT PDH. A WMI query can take tens of milliseconds; at that cost
+// the instrument disturbs what it measures, and the frame-time percentiles
+// this agent collects would become partly an artifact of collecting them. The
+// calls used here -- GetProcessTimes, GetProcessMemoryInfo,
+// GetProcessIoCounters -- are microseconds.
+//
+// Two optimisations matter on the CPU budget:
+//   1. Handles are cached across ticks. OpenProcess is the expensive call, and
+//      reopening 11 processes every 10 s for the life of an ATM is waste.
+//   2. Full enumeration runs every Nth tick, not every tick. Process churn is
+//      not a 10-second phenomenon.
+#pragma once
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "edgevitals/Config.h"
+
+namespace ev {
+
+// One sample of one process, already differenced against the previous tick.
+struct ProcSample {
+    bool valid = false;          // false => leave the row cells EMPTY, not zero
+    unsigned long pid = 0;
+    double cpuPct = 0.0;         // % of one core, 0-100*ncores
+    double cpuKernelPct = 0.0;
+    double rssMb = 0.0;
+    double privateMb = 0.0;
+    double peakRssMb = 0.0;
+    double pageFaultDelta = 0.0;
+    double handles = 0.0;
+    double threads = 0.0;
+    double gdiObjects = 0.0;     // UI processes only; 0 elsewhere
+    double userObjects = 0.0;
+    double ioReadMbs = 0.0;
+    double ioWriteMbs = 0.0;
+    double ioReadOps = 0.0;
+    double ioWriteOps = 0.0;
+    // Total processor time since the role bound. A rate answers "is this bad
+    // right now"; a total answers "where is optimisation effort worth
+    // spending", which is a different and often more useful question.
+    double cpuSeconds = 0.0;
+    const char* priority = "";   // "" when unreadable -- never a default
+    // Set when the process was seen but could not be fully read. Logged rather
+    // than dropped: "could not read PID 4312" is information.
+    std::string note;
+};
+
+// A process discovered on the machine, whether tracked or not.
+struct ProcInfo {
+    unsigned long pid = 0;
+    unsigned long parentPid = 0;
+    std::string exeName;         // lowercased file name
+    std::string exePath;         // full path, empty if unreadable
+    unsigned long threads = 0;
+};
+
+class ProcessSampler {
+public:
+    explicit ProcessSampler(const Config& cfg);
+    ~ProcessSampler();
+
+    ProcessSampler(const ProcessSampler&) = delete;
+    ProcessSampler& operator=(const ProcessSampler&) = delete;
+
+    // Full machine enumeration. Call every enumerate_every_ticks, not every
+    // tick -- this is the expensive operation in the whole agent.
+    std::vector<ProcInfo> enumerate();
+
+    // Advanced by the Agent each tick so open-retry backoff can be expressed
+    // in ticks rather than duplicating the clock down here. PUBLIC: the Agent
+    // calls it every tick -- it landed in the private section first time and
+    // the Win32 build caught it.
+    void setTick(long long t) { tick_ = t; }
+
+    // Re-resolve which PIDs match which tracked role, from an enumeration.
+    // A role with several live PIDs (spawned Piper instances) aggregates them.
+    void bindRoles(const std::vector<ProcInfo>& all);
+
+    // Sample every bound role. elapsedNs is wall time since the previous call
+    // and is what CPU percentages are computed against -- using the nominal
+    // interval instead would misreport whenever a tick runs late.
+    std::unordered_map<std::string, ProcSample> sampleAll(std::uint64_t elapsedNs);
+
+    // Number of live PIDs currently bound to a role.
+    size_t liveCount(const std::string& role) const;
+
+private:
+    struct Tracked {
+        void* handle = nullptr;              // HANDLE, cached across ticks
+        unsigned long pid = 0;
+        // Process identity is (pid, createTime), never pid alone. Windows
+        // reuses PIDs, and a reused PID silently continues the previous
+        // process's column series -- which a trend detector then reads as a
+        // continuous history across two unrelated processes.
+        std::uint64_t createTime = 0;
+        // Total processor time consumed since this role bound, in seconds.
+        // Reset with the counters on exit or PID reuse, because carrying a
+        // total across two different processes is meaningless.
+        double cpuSeconds = 0.0;
+        // Consecutive failed opens, and the tick to retry on. A role that is
+        // not running costs FAR more per tick than one that is: measured on
+        // the terminal, sample ticks with a role absent were 3.68 ms p95
+        // against 0.39 ms with it present, because a failing OpenProcess is
+        // slower than querying a cached handle. With ten roles unbound that
+        // is the dominant sampling cost, so back off instead of retrying
+        // every tick.
+        int openFails = 0;
+        long long retryAtTick = 0;
+        std::uint64_t lastKernel100ns = 0;
+        std::uint64_t lastUser100ns = 0;
+        std::uint64_t lastReadBytes = 0;
+        std::uint64_t lastWriteBytes = 0;
+        std::uint64_t lastReadOps = 0;
+        std::uint64_t lastWriteOps = 0;
+        std::uint64_t lastPageFaults = 0;
+        unsigned long threads = 0;           // from the last enumeration
+        bool gui = false;                    // emit GDI/USER for this role
+        bool fullAccess = false;             // got PROCESS_QUERY_INFORMATION
+        bool primed = false;                 // first tick yields no delta
+    };
+
+    bool openIfNeeded(Tracked& t);
+    void closeHandle(Tracked& t);
+    // True while the process behind this handle is still running. A cached
+    // handle stays valid after exit and Windows answers queries with zeros,
+    // so without this a dead process reports 0 MB and looks like a live one
+    // using no memory.
+    bool isAlive(const Tracked& t) const;
+    void resetCounters(Tracked& t);
+    // PRIORITY_CLASS as a short lowercase word. Empty when it cannot be read,
+    // never a default -- "we could not ask" and "it is normal" are different
+    // facts and a bank reviewer will ask which one they are looking at.
+    static const char* priorityName(void* handle);
+    bool sampleOne(Tracked& t, std::uint64_t elapsedNs, ProcSample& out);
+
+    const Config& cfg_;
+    long long tick_ = 0;
+    // role -> live instances. A vector because Piper and Rhubarb may briefly
+    // have more than one, and dropping the second would understate the peak.
+    std::unordered_map<std::string, std::vector<Tracked>> bound_;
+};
+
+}  // namespace ev
+***********
+Row.h
+// Schema and Row.
+//
+// Design note: the schema is BUILT AT RUNTIME from config rather than being a
+// fixed struct of 70 named fields. Two reasons, both of which came out of the
+// sizing work:
+//
+//   1. The tracked-process list is config-driven, so the column set is too.
+//      Adding a process to watch must not require a recompile.
+//
+//   2. Clients push their own columns over the pipe. EdgeVitals does not know
+//      what a "frame_p99_ms" is and should not have to -- EdgeTerminal knows.
+//      Open/closed: new metrics ship without touching the agent.
+//
+// Cell carries an explicit Empty state. This is not pedantry: a component that
+// is not licensed and a component that is idle must never both render as 0.0,
+// or the CSV is unreadable six weeks later.
+#pragma once
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace ev {
+
+class Cell {
+public:
+    enum class Kind { Empty, Number, Text };
+
+    Cell() = default;
+    static Cell number(double v) { Cell c; c.kind_ = Kind::Number; c.num_ = v; return c; }
+    static Cell text(std::string v) { Cell c; c.kind_ = Kind::Text; c.txt_ = std::move(v); return c; }
+
+    Kind kind() const { return kind_; }
+    bool empty() const { return kind_ == Kind::Empty; }
+    double num() const { return num_; }
+    const std::string& txt() const { return txt_; }
+
+    // CSV rendering. Empty -> "" (not "0"). Numbers use the given precision
+    // and drop a trailing ".0" so integers stay integers in the file.
+    std::string toCsv(int precision) const;
+
+private:
+    Kind kind_ = Kind::Empty;
+    double num_ = 0.0;
+    std::string txt_;
+};
+
+// Ordered column list. Order is fixed once frozen, because the CSV header is
+// written once per file and every row must match it positionally.
+class Schema {
+public:
+    // Returns the column index. Adding a column after freeze() is a no-op
+    // returning npos -- a late column would desynchronise every row already
+    // written to today's file.
+    size_t add(const std::string& name, int precision = 2);
+    void freeze() { frozen_ = true; }
+    bool frozen() const { return frozen_; }
+
+    size_t size() const { return names_.size(); }
+    size_t indexOf(const std::string& name) const;  // npos if absent
+    const std::string& name(size_t i) const { return names_[i]; }
+    int precision(size_t i) const { return precision_[i]; }
+
+    std::string headerCsv() const;
+
+    static constexpr size_t npos = static_cast<size_t>(-1);
+
+private:
+    std::vector<std::string> names_;
+    std::vector<int> precision_;
+    std::unordered_map<std::string, size_t> index_;
+    bool frozen_ = false;
+};
+
+class Row {
+public:
+    explicit Row(const Schema& s) : schema_(&s), cells_(s.size()) {}
+
+    void set(size_t col, Cell c) { if (col < cells_.size()) cells_[col] = std::move(c); }
+    void setNumber(size_t col, double v) { set(col, Cell::number(v)); }
+    void setText(size_t col, std::string v) { set(col, Cell::text(std::move(v))); }
+
+    // Named setters. Silently ignore unknown names so a client pushing a
+    // column we do not carry cannot take the service down.
+    bool setNumber(const std::string& name, double v);
+    bool setText(const std::string& name, std::string v);
+
+    const Cell& at(size_t col) const { return cells_[col]; }
+    void clear() { for (auto& c : cells_) c = Cell{}; }
+
+    std::string toCsv() const;
+
+private:
+    const Schema* schema_;
+    std::vector<Cell> cells_;
+};
+
+// RFC4180 quoting: wrap in quotes and double any embedded quote, but only
+// when the value actually needs it. Unconditional quoting would bloat a file
+// that is 95% numbers.
+std::string csvEscape(const std::string& v);
+
+}  // namespace ev
+***********
+SystemSampler.h
+#pragma once
+#include <cstdint>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "edgevitals/Config.h"
+#include "edgevitals/CsvSink.h"
+#include "edgevitals/ProcessSampler.h"
+
+namespace ev {
+
+struct SystemSample {
+    double cpuPct = 0.0;        // machine-wide, 0-100
+    double availMb = 0.0;       // available physical
+    double totalMb = 0.0;
+    double commitPct = 0.0;     // commit charge / commit limit
+    double diskFreeMb = 0.0;
+    int cores = 1;
+};
+
+// System-wide counters. commitPct is the number that predicts trouble on a
+// 4 GB box: a process can look healthy at 300 MB while the machine swaps
+// because Windows plus the vendor device runtime plus vision took the rest.
+class SystemSampler {
+public:
+    SystemSampler();
+    SystemSample sample(const std::string& diskPathHint);
+    int cores() const { return cores_; }
+
+private:
+    int cores_ = 1;
+    std::uint64_t lastIdle_ = 0, lastKernel_ = 0, lastUser_ = 0;
+    bool primed_ = false;
+};
+
+// Win32 implementation of the disk-space port CsvSink depends on.
+class Win32DiskSpace : public IDiskSpace {
+public:
+    double freeMbAt(const std::string& dir) override;
+};
+
+// Records binaries seen running that are not in the tracked list and not in
+// the system allowlist.
+//
+// SCOPE BOUNDARY, deliberate: this OBSERVES. It never blocks, alerts or
+// enforces. Unknown-binary detection on an ATM is EdgeBastion's territory;
+// two detection paths in one portfolio is a confused story in front of a
+// bank. If a finding needs teeth, it belongs there, not here.
+class DiscoveryLog {
+public:
+    DiscoveryLog(std::string path, std::vector<std::string> systemAllowlist,
+                 std::vector<std::string> trackedExe);
+
+    // Loads already-recorded entries so a restart does not re-log the machine.
+    void loadExisting();
+
+    // Appends any newly-seen unknown binary. Dedup is by lowercased full path
+    // (or name when the path is unreadable), so a chatty updater produces one
+    // row, not one per sighting. Returns how many new rows were written.
+    int record(const std::vector<ProcInfo>& all, const std::string& nowIso);
+
+    size_t knownCount() const { return seen_.size(); }
+
+private:
+    bool isKnown(const ProcInfo& p) const;
+
+    std::string path_;
+    std::set<std::string> allow_;    // lowercased
+    std::set<std::string> tracked_;  // lowercased
+    std::set<std::string> seen_;     // lowercased path or name
+};
+
+// Local time as ISO-8601 plus the calendar date, taken together so a tick
+// spanning midnight cannot log a timestamp from one day into the other's file.
+void nowLocal(std::string& iso, Date& date);
+
+// Monotonic nanoseconds. Not wall time: the interval must not jump when NTP
+// steps the clock, or one tick reports an impossible CPU percentage.
+std::uint64_t monotonicNs();
+
+}  // namespace ev
+***********
