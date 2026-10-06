@@ -35,6 +35,18 @@ struct ProcSample {
     double threads = 0.0;
     double gdiObjects = 0.0;     // UI processes only; 0 elsewhere
     double userObjects = 0.0;
+    // Whether handles / gdi+user were actually READ. A failed
+    // GetProcessHandleCount or GetGuiResources leaves 0 in the value, and 0
+    // written to the CSV says "holds no handles" -- the opposite of "could not
+    // ask". For a multi-PID role these are true only when EVERY live instance
+    // was read: a sum that silently omits one instance is a wrong number, not
+    // a partial one.
+    bool handlesValid = false;
+    bool guiValid = false;
+    // Order-independent signature of the live (pid, creation time) set. Changes
+    // on restart, PID reuse, or an instance that could not be read this tick.
+    // The handle probe uses it to refuse comparing across two process sets.
+    std::uint64_t identity = 0;
     double ioReadMbs = 0.0;
     double ioWriteMbs = 0.0;
     double ioReadOps = 0.0;
@@ -87,6 +99,11 @@ public:
 
     // Number of live PIDs currently bound to a role.
     size_t liveCount(const std::string& role) const;
+
+    // PIDs of a role's instances that hold an open handle -- i.e. that were
+    // sampled successfully on the last sampleAll. These are the PIDs whose
+    // handle-count sum the row reports, so a probe tallied over them matches.
+    void livePids(const std::string& role, std::vector<unsigned long>& out) const;
 
 private:
     struct Tracked {

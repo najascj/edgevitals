@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 
+#include <memory>
+
+#include "edgevitals/ChainedFile.h"
 #include "edgevitals/Config.h"
 #include "edgevitals/CsvSink.h"
 #include "edgevitals/ProcessSampler.h"
@@ -49,23 +52,32 @@ public:
 // bank. If a finding needs teeth, it belongs there, not here.
 class DiscoveryLog {
 public:
-    DiscoveryLog(std::string path, std::vector<std::string> systemAllowlist,
-                 std::vector<std::string> trackedExe);
-
-    // Loads already-recorded entries so a restart does not re-log the machine.
-    void loadExisting();
+    // pathTemplate is undated (logs/unknown-processes.csv); the day is
+    // inserted per file. chainEvery > 0 chains the file like the agent log.
+    DiscoveryLog(std::string pathTemplate, std::vector<std::string> systemAllowlist,
+                 std::vector<std::string> trackedExe, int chainEvery);
+    // Switches to the file for day d -- sealing the previous day -- and loads
+    // what d's file already holds, so a restart does not re-log the machine.
+    // Before 3.2.1 the file was dated once at start-up and never rotated: a
+    // 24x7 agent wrote every day into its start-day file, which retention
+    // then archived and deleted while it was still being appended to.
+    void openFor(const Date& d);
 
     // Appends any newly-seen unknown binary. Dedup is by lowercased full path
     // (or name when the path is unreadable), so a chatty updater produces one
     // row, not one per sighting. Returns how many new rows were written.
-    int record(const std::vector<ProcInfo>& all, const std::string& nowIso);
+    int record(const std::vector<ProcInfo>& all, const std::string& nowIso, const Date& today);
 
     size_t knownCount() const { return seen_.size(); }
 
 private:
     bool isKnown(const ProcInfo& p) const;
-
+    void loadExisting();
+    std::string template_;
     std::string path_;
+    Date day_{};
+    bool haveDay_ = false;
+    std::unique_ptr<ChainedFile> out_;
     std::set<std::string> allow_;    // lowercased
     std::set<std::string> tracked_;  // lowercased
     std::set<std::string> seen_;     // lowercased path or name

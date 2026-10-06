@@ -32,8 +32,18 @@ bool IpcServer::start() {
 }
 
 void IpcServer::stop() {
-    if (!running_.load()) return;
+    // NO early return on !running_. The listener sets running_ = false itself
+    // when the pipe cannot be created -- a squatted name, or an SDDL the
+    // system rejects. Returning here left a JOINABLE std::thread for the
+    // destructor to destroy, which is exactly "terminate called without an
+    // active exception" on shutdown. Observed 23 Sep after client_sid was
+    // changed to IU and pipe creation began failing.
+    const bool wasRunning = running_.load();
     running_.store(false);
+    if (!wasRunning) {
+        if (listener_.joinable()) listener_.join();
+        return;
+    }
     if (stopEvent_) SetEvent(static_cast<HANDLE>(stopEvent_));
     // Unblock a ConnectNamedPipe that is waiting with no client by connecting
     // to our own pipe once. Without this the listener thread would sit until
@@ -116,6 +126,7 @@ void IpcServer::listenLoop() {
             continue;
         }
         first = false;
+        listening_.store(true);   // the pipe now genuinely exists
 
         const BOOL ok = ConnectNamedPipe(pipe, nullptr);
         if (!running_.load()) {
@@ -205,6 +216,16 @@ void IpcServer::handleLine(const std::string& line, std::string& reply) {
         std::lock_guard<std::mutex> lk(mu_);
         reply = snapshot_.empty() ? "{\"ok\":1,\"snapshot\":null}" : snapshot_;
         return;
+    }
+
+    // Heartbeat: {"hb":1,"role":"ui"}. Recorded by role on the monotonic
+    // clock. Bounded: at most 64 roles, names up to 32 characters.
+    if (j.has("hb")) {
+        const std::string role = j["role"].asString();
+        if (!role.empty() && role.size() <= 32) {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (hb_.size() < 64 || hb_.count(role)) hb_[role] = std::chrono::steady_clock::now();
+        }
     }
 
     int taken = 0;

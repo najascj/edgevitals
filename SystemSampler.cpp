@@ -112,11 +112,29 @@ double Win32DiskSpace::freeMbAt(const std::string& dir) {
 }
 
 // ── discovery ────────────────────────────────────────────────────────────
-DiscoveryLog::DiscoveryLog(std::string path, std::vector<std::string> systemAllowlist,
-                           std::vector<std::string> trackedExe)
-    : path_(std::move(path)) {
+DiscoveryLog::DiscoveryLog(std::string pathTemplate, std::vector<std::string> systemAllowlist,
+                           std::vector<std::string> trackedExe, int chainEvery)
+    : template_(std::move(pathTemplate)), out_(new ChainedFile(chainEvery)) {
     for (auto& a : systemAllowlist) allow_.insert(toLower(a));
     for (auto& t : trackedExe) tracked_.insert(toLower(t));
+}
+
+void DiscoveryLog::openFor(const Date& d) {
+    out_->close();   // seals the outgoing day, if one was open
+    day_ = d;
+    haveDay_ = true;
+    // "unknown-processes.csv" -> "unknown-processes-YYYY-MM-DD.csv": the name
+    // the retention classifier already recognises.
+    const size_t slash = template_.find_last_of("/\\");
+    const size_t dot = template_.rfind('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        path_ = template_.substr(0, dot) + "-" + d.iso() + template_.substr(dot);
+    else
+        path_ = template_ + "-" + d.iso();
+    seen_.clear();
+    loadExisting();
+    // The file itself opens on the first new row: a day with no unknown
+    // binaries leaves no file, as before.
 }
 
 void DiscoveryLog::loadExisting() {
@@ -145,7 +163,9 @@ bool DiscoveryLog::isKnown(const ProcInfo& p) const {
     return false;
 }
 
-int DiscoveryLog::record(const std::vector<ProcInfo>& all, const std::string& nowIso) {
+int DiscoveryLog::record(const std::vector<ProcInfo>& all, const std::string& nowIso,
+                         const Date& today) {
+    if (!haveDay_ || day_ != today) openFor(today);
     std::vector<const ProcInfo*> fresh;
     for (const auto& p : all) {
         if (p.pid == 0 || p.pid == 4) continue;  // System Idle / System
@@ -162,17 +182,22 @@ int DiscoveryLog::record(const std::vector<ProcInfo>& all, const std::string& no
     if (!parent.empty()) fs::create_directories(parent, ec);
 
     const bool existed = fs::exists(path_, ec) && fs::file_size(path_, ec) > 0;
-    std::ofstream out(path_, std::ios::app);
-    if (!out) return 0;
-    if (!existed) out << "first_seen,exe_name,exe_path,parent_pid,note,key\n";
+    if (!out_->isOpen()) {
+        std::string err;
+        if (!out_->open(path_, err)) return 0;
+    }
+    // Chained like the other two streams: every byte, header included.
+    if (!existed) out_->append("first_seen,exe_name,exe_path,parent_pid,note,key\n");
 
     for (const ProcInfo* p : fresh) {
         // An unreadable path is recorded as a note rather than dropped.
         // "Could not read PID 4312" is information; a missing row is not.
         const std::string note = p->exePath.empty() ? "path unreadable" : "";
-        out << nowIso << ',' << csvEscape(p->exeName) << ',' << csvEscape(p->exePath) << ','
-            << p->parentPid << ',' << note << ','
-            << toLower(p->exePath.empty() ? p->exeName : p->exePath) << '\n';
+        std::ostringstream line;
+        line << nowIso << ',' << csvEscape(p->exeName) << ',' << csvEscape(p->exePath) << ','
+             << p->parentPid << ',' << note << ','
+             << toLower(p->exePath.empty() ? p->exeName : p->exePath) << '\n';
+        out_->append(line.str());
     }
     return static_cast<int>(fresh.size());
 }

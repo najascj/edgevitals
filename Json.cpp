@@ -67,7 +67,29 @@ private:
     const std::string& s_;
     size_t i_ = 0;
     size_t line_ = 1;
+    int depth_ = 0;
     std::string msg_;
+
+    // Nesting limit. value() recurses through object() and array(), so a
+    // document of nothing but '[' drives one stack frame per character. On a
+    // 1 MB thread stack -- the Windows default -- this crashed the process
+    // between 4,000 and 5,000 levels, and the IPC read loop accepts 256 KB,
+    // which carries 262,144. A client sends 5 KB and the agent dies.
+    //
+    // 64 is far past anything real: the shipped config nests 4 deep and the
+    // IPC protocol is a flat object. A document deeper than this is either a
+    // mistake or an attack, and both deserve the same answer.
+    static constexpr int kMaxDepth = 64;
+
+    // RAII so every early return unwinds the counter. There are a dozen
+    // failure paths through object() and array(); a manual decrement would be
+    // forgotten on one of them.
+    struct Depth {
+        JsonParser& p;
+        bool ok;
+        explicit Depth(JsonParser& parser) : p(parser), ok(++parser.depth_ <= kMaxDepth) {}
+        ~Depth() { --p.depth_; }
+    };
 
     std::string error() const { return "line " + std::to_string(line_) + ": " + msg_; }
     bool fail(const char* m) { if (msg_.empty()) msg_ = m; return false; }
@@ -109,6 +131,8 @@ private:
 
     bool value(Json& v) {
         if (i_ >= s_.size()) return fail("unexpected end of input");
+        Depth guard(*this);
+        if (!guard.ok) return fail("nesting too deep");
         char c = s_[i_];
         if (c == '{') return object(v);
         if (c == '[') return array(v);
@@ -212,21 +236,43 @@ private:
     }
 
     bool number(Json& v) {
-        size_t start = i_;
-        if (i_ < s_.size() && (s_[i_] == '-' || s_[i_] == '+')) ++i_;
+        // Leniency here is not kindness. "1e" and "+1" were both accepted by
+        // the earlier version, so a fat-fingered config value parsed as a
+        // number rather than being reported, and the operator got a silently
+        // wrong setting instead of an error naming the line.
+        const size_t start = i_;
+
+        // JSON allows a leading '-' only. '+1' is not a number.
+        if (i_ < s_.size() && s_[i_] == '-') ++i_;
+
         bool any = false;
         while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; any = true; }
+
         if (i_ < s_.size() && s_[i_] == '.') {
             ++i_;
-            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; any = true; }
+            bool frac = false;
+            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; frac = true; }
+            // A '.' must be followed by at least one digit: "1." is malformed.
+            if (!frac) return fail("digit expected after '.'");
+            any = true;
         }
-        if (any && i_ < s_.size() && (s_[i_] == 'e' || s_[i_] == 'E')) {
+
+        if (!any) return fail("expected a value");
+
+        if (i_ < s_.size() && (s_[i_] == 'e' || s_[i_] == 'E')) {
             ++i_;
             if (i_ < s_.size() && (s_[i_] == '-' || s_[i_] == '+')) ++i_;
-            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') ++i_;
+            bool expDigits = false;
+            while (i_ < s_.size() && s_[i_] >= '0' && s_[i_] <= '9') { ++i_; expDigits = true; }
+            // "1e" and "1e+" are malformed, not 1.
+            if (!expDigits) return fail("digit expected in exponent");
         }
-        if (!any) return fail("expected a value");
+
         v.type_ = Json::Type::Number;
+        // strtod saturates to +/-HUGE_VAL on overflow and sets errno; the
+        // saturated value is what we want -- 1e999999999 becoming inf is
+        // correct, and Row renders non-finite values as EMPTY rather than a
+        // number a spreadsheet would choke on.
         v.num_ = std::strtod(s_.substr(start, i_ - start).c_str(), nullptr);
         return true;
     }

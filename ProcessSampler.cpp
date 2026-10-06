@@ -27,6 +27,15 @@ std::uint64_t toU64(const FILETIME& ft) {
 
 constexpr double kMb = 1024.0 * 1024.0;
 
+// splitmix64 finaliser over (pid, creation time). Summed across a role's
+// instances, so the result does not depend on enumeration order.
+std::uint64_t identityOf(unsigned long pid, std::uint64_t created) {
+    std::uint64_t z = (static_cast<std::uint64_t>(pid) * 0x9E3779B97F4A7C15ull) ^ created;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
 }  // namespace
 
 ProcessSampler::ProcessSampler(const Config& cfg) : cfg_(cfg) {}
@@ -277,10 +286,14 @@ bool ProcessSampler::sampleOne(Tracked& t, std::uint64_t elapsedNs, ProcSample& 
     IO_COUNTERS io{};
     const bool haveIo = GetProcessIoCounters(h, &io) != 0;
 
+    // Return value checked. It was ignored, so a failed call left 0 in place
+    // and the row reported a live process holding no handles at all.
     DWORD handles = 0;
-    GetProcessHandleCount(h, &handles);
+    const bool haveHandles = GetProcessHandleCount(h, &handles) != 0;
 
     out.pid = t.pid;
+    out.identity = identityOf(t.pid, created);
+    out.handlesValid = haveHandles;
     out.rssMb = static_cast<double>(pmc.WorkingSetSize) / kMb;
     out.privateMb = static_cast<double>(pmc.PrivateUsage) / kMb;
     out.peakRssMb = static_cast<double>(pmc.PeakWorkingSetSize) / kMb;
@@ -289,8 +302,22 @@ bool ProcessSampler::sampleOne(Tracked& t, std::uint64_t elapsedNs, ProcSample& 
     if (t.gui && t.fullAccess) {
         // Qt applications leak these, and an ATM runs for weeks. A slow
         // upward ramp here is the tell long before anything looks wrong.
-        out.gdiObjects = GetGuiResources(h, GR_GDIOBJECTS);
-        out.userObjects = GetGuiResources(h, GR_USEROBJECTS);
+        //
+        // GetGuiResources returns 0 both for "no objects" and for failure, so
+        // the error state is cleared first and read after. Without a full-
+        // access handle these are never attempted and guiValid stays false:
+        // the cells are EMPTY, where before they were written as 0.
+        SetLastError(ERROR_SUCCESS);
+        const DWORD gdi = GetGuiResources(h, GR_GDIOBJECTS);
+        const bool gdiOk = gdi != 0 || GetLastError() == ERROR_SUCCESS;
+        SetLastError(ERROR_SUCCESS);
+        const DWORD usr = GetGuiResources(h, GR_USEROBJECTS);
+        const bool usrOk = usr != 0 || GetLastError() == ERROR_SUCCESS;
+        if (gdiOk && usrOk) {
+            out.gdiObjects = gdi;
+            out.userObjects = usr;
+            out.guiValid = true;
+        }
     }
 
     if (!t.primed) {
@@ -358,6 +385,8 @@ std::unordered_map<std::string, ProcSample> ProcessSampler::sampleAll(std::uint6
         ProcSample agg;
         int live = 0;
         std::string firstNote;
+        bool allHandles = true, allGui = true;
+        std::uint64_t identity = 0;
 
         for (auto& t : kv.second) {
             ProcSample s;
@@ -376,6 +405,9 @@ std::unordered_map<std::string, ProcSample> ProcessSampler::sampleAll(std::uint6
             agg.peakRssMb = (std::max)(agg.peakRssMb, s.peakRssMb);
             agg.pageFaultDelta += s.pageFaultDelta;
             agg.handles += s.handles;
+            if (!s.handlesValid) allHandles = false;
+            if (!s.guiValid) allGui = false;
+            identity += s.identity;
             agg.threads += s.threads;
             agg.gdiObjects += s.gdiObjects;
             agg.userObjects += s.userObjects;
@@ -399,6 +431,9 @@ std::unordered_map<std::string, ProcSample> ProcessSampler::sampleAll(std::uint6
         // valid stays false when nothing is running. The row then carries
         // EMPTY cells, so "not licensed" and "idle" never both read as 0.
         agg.valid = live > 0;
+        agg.handlesValid = live > 0 && allHandles;
+        agg.guiValid = live > 0 && allGui;
+        agg.identity = identity;
         agg.note = firstNote;
         out[kv.first] = agg;
     }
@@ -408,6 +443,14 @@ std::unordered_map<std::string, ProcSample> ProcessSampler::sampleAll(std::uint6
 size_t ProcessSampler::liveCount(const std::string& role) const {
     auto it = bound_.find(role);
     return it == bound_.end() ? 0 : it->second.size();
+}
+
+void ProcessSampler::livePids(const std::string& role, std::vector<unsigned long>& out) const {
+    out.clear();
+    auto it = bound_.find(role);
+    if (it == bound_.end()) return;
+    for (const auto& t : it->second)
+        if (t.handle) out.push_back(t.pid);
 }
 
 }  // namespace ev

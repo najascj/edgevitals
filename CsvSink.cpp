@@ -18,6 +18,36 @@
 namespace fs = std::filesystem;
 
 namespace ev {
+namespace {
+
+// Last checkpoint hash in a sidecar, or "genesis" if there is none. Lets a
+// chain resume across an agent restart instead of starting over.
+
+// True when the sidecar's last record is a seal.
+static bool chainIsSealed(const std::string& sidecar) {
+    std::ifstream in(sidecar);
+    if (!in) return false;
+    std::string line, last;
+    while (std::getline(in, line)) if (!line.empty()) last = line;
+    return last.find("\"final\":1") != std::string::npos;
+}
+
+static std::string lastChainHash(const std::string& sidecar) {
+    std::ifstream in(sidecar);
+    if (!in) return "genesis";
+    std::string line, last;
+    while (std::getline(in, line))
+        if (line.find("\"hash\"") != std::string::npos) last = line;
+    if (last.empty()) return "genesis";
+    const std::string key = "\"hash\":\"";
+    const auto p = last.find(key);
+    if (p == std::string::npos) return "genesis";
+    const auto s = p + key.size();
+    const auto e = last.find('"', s);
+    return e == std::string::npos ? std::string("genesis") : last.substr(s, e - s);
+}
+}  // namespace
+
 
 std::string Date::iso() const {
     char buf[16];
@@ -61,6 +91,19 @@ CsvSink::~CsvSink() { close(); }
 
 void CsvSink::close() {
     if (fp_) {
+        // Seal BEFORE closing the handle. A day file that ends without a final
+        // checkpoint is indistinguishable from one an attacker truncated, and
+        // anything appended afterwards would otherwise verify as "trailing
+        // bytes, normal for a live file".
+        if (chain_ && !chainPath_.empty() && !chain_->sealed()) {
+            std::fflush(fp_);
+            const std::string line = chain_->seal() + "\n";
+            if (std::FILE* cf = std::fopen(chainPath_.c_str(), "ab")) {
+                std::fwrite(line.data(), 1, line.size(), cf);
+                std::fflush(cf);
+                std::fclose(cf);
+            }
+        }
         std::fclose(fp_);
         fp_ = nullptr;
     }
@@ -77,8 +120,38 @@ bool CsvSink::openFor(const Date& d) {
         return false;
     }
 
-    const std::string name = opts_.prefix + "-" + d.iso() + ".csv";
+    std::string name = opts_.prefix + "-" + d.iso() + ".csv";
     path_ = (fs::path(opts_.dir) / name).string();
+
+    // SCHEMA GUARD.
+    // Appending to an existing day file is correct only if that file has the
+    // SAME columns. On 23 Sep the agent started once on the built-in defaults
+    // (11 roles, 222 columns), then again with the real config (17 roles, 312
+    // columns) -- and appended 1,690 rows of 312 fields under a 222-field
+    // header. The result parses in no CSV reader at all: the day's data was
+    // recoverable only by reconstructing the header by hand.
+    //
+    // So: if the first line of the existing file is not this schema's header,
+    // do NOT append. Roll to prefix-YYYY-MM-DD.2.csv and say why. Losing the
+    // file name is a nuisance; losing the day is not.
+    {
+        const std::string want = schema_.headerCsv();
+        int suffix = 1;
+        for (;;) {
+            std::error_code ex;
+            if (!fs::exists(path_, ex) || fs::file_size(path_, ex) == 0) break;
+            std::ifstream probe(path_, std::ios::binary);
+            std::string firstLine;
+            std::getline(probe, firstLine);
+            probe.close();
+            if (!firstLine.empty() && firstLine.back() == '\r') firstLine.pop_back();
+            if (firstLine == want) break;              // same schema: append
+            ++suffix;
+            name = opts_.prefix + "-" + d.iso() + "." + std::to_string(suffix) + ".csv";
+            path_ = (fs::path(opts_.dir) / name).string();
+            schemaRolled_ = true;
+        }
+    }
 
     const bool existed = fs::exists(path_, ec) && fs::file_size(path_, ec) > 0;
     fp_ = std::fopen(path_.c_str(), "ab");
@@ -88,13 +161,52 @@ bool CsvSink::openFor(const Date& d) {
     }
     // Header only on a genuinely new file. Reopening after a service restart
     // mid-day must append, not write a second header into the middle.
+    // One chain per file. Rebuilt on rotation so each day verifies standalone.
+    // On reopen mid-day the chain restarts from genesis and its first
+    // checkpoint covers only what follows -- the sidecar records the byte
+    // offset, so a verifier sees exactly which span each segment covers rather
+    // than silently assuming it covers the whole file.
+    if (opts_.chainEveryRows > 0) {
+        // Start the chain at the file's CURRENT size. Opened for append, a
+        // chain that began at zero described byte ranges that did not exist.
+        std::error_code sz;
+        const auto already = fs::exists(path_, sz) ? fs::file_size(path_, sz) : 0;
+        chain_.reset(new HashChain(name,
+                                   sz ? 0 : static_cast<std::uint64_t>(already),
+                                   lastChainHash(path_ + ".chain")));
+        chainPath_ = path_ + ".chain";
+        // If the previous run sealed this file, say so before appending a byte.
+        if (chainIsSealed(chainPath_)) {
+            const std::string rec = chain_->reopen() + "\n";
+            if (std::FILE* cf = std::fopen(chainPath_.c_str(), "ab")) {
+                std::fwrite(rec.data(), 1, rec.size(), cf);
+                std::fflush(cf);
+                std::fclose(cf);
+            }
+        }
+        chainPath_ = path_ + ".chain";
+        sinceCheckpoint_ = 0;
+    } else {
+        chain_.reset();
+        chainPath_.clear();
+    }
+
     if (!existed) {
         const std::string h = schema_.headerCsv();
         std::fwrite(h.data(), 1, h.size(), fp_);
         std::fputc('\n', fp_);
         std::fflush(fp_);
+        chainFeed(h + "\n");
     }
     openDate_ = d;
+    if (schemaRolled_) {
+        // Not an error -- the agent keeps running -- but the operator must know
+        // the day's data is in two files with different column sets.
+        lastError_ = "column set differs from the existing day file; rolled to " +
+                     name + " rather than appending mismatched rows";
+        schemaRolled_ = false;
+        return true;
+    }
     lastError_.clear();
     return true;
 }
@@ -120,7 +232,7 @@ bool CsvSink::write(const Row& row, const Date& today) {
     if (!fp_ || openDate_ != today) {
         const bool rotating = (fp_ != nullptr);
         if (!openFor(today)) return false;
-        if (rotating) purgeOldFiles(today);
+        if (rotating) maintainAllStreams(today);
     }
 
     // One buffered write per row. The row is assembled in memory first so a
@@ -133,15 +245,61 @@ bool CsvSink::write(const Row& row, const Date& today) {
         return false;
     }
     if (opts_.flushEveryTick) std::fflush(fp_);
+
+    // Feed AFTER a confirmed full write: the chain must describe what is on
+    // disk, not what we intended to write.
+    chainFeed(line);
+    if (chain_ && ++sinceCheckpoint_ >= opts_.chainEveryRows) chainCheckpoint();
     return true;
 }
 
+void CsvSink::chainFeed(const std::string& bytes) {
+    if (chain_) chain_->feed(bytes);
+}
+
+void CsvSink::chainCheckpoint() {
+    if (!chain_ || chainPath_.empty()) return;
+    const std::string line = chain_->checkpoint() + "\n";
+    // Append and flush immediately. A checkpoint still sitting in a buffer
+    // when the process dies covers rows nobody can verify.
+    std::FILE* f = std::fopen(chainPath_.c_str(), "ab");
+    if (!f) { lastError_ = "cannot write " + chainPath_; return; }
+    std::fwrite(line.data(), 1, line.size(), f);
+    std::fflush(f);
+    std::fclose(f);
+    sinceCheckpoint_ = 0;
+}
+
 namespace {
+
+
+
 
 // Recognises prefix-YYYY-MM-DD.csv and prefix-YYYY-MM-DD.csv.zip and nothing
 // else. Anything whose date cannot be parsed out of its own name belongs to
 // somebody else and is never touched -- deleting a stranger's file because it
 // happened to share a directory is not a recoverable mistake.
+// Recognises "<pre>YYYY-MM-DD<ext>" and its ".zip" form. Parameterised on the
+// extension so ONE maintenance sweep covers all three streams: the telemetry
+// CSV, the discovery CSV and the agent's own .log. Keying it on a single
+// hard-coded prefix meant the discovery log was rotated but never archived or
+// purged -- it simply accumulated, outside retention entirely.
+bool classifyExt(const std::string& name, const std::string& pre,
+                 const std::string& ext, Date& d, bool& isZip) {
+    const std::string zipExt = ext + ".zip";
+    if (name.size() < pre.size() || name.compare(0, pre.size(), pre) != 0) return false;
+    if (name.size() == pre.size() + 10 + ext.size() &&
+        name.compare(name.size() - ext.size(), ext.size(), ext) == 0) {
+        isZip = false;
+    } else if (name.size() == pre.size() + 10 + zipExt.size() &&
+               name.compare(name.size() - zipExt.size(), zipExt.size(), zipExt) == 0) {
+        isZip = true;
+    } else {
+        return false;
+    }
+    return Date::parseIso(name.substr(pre.size(), 10), d);
+}
+
 bool classify(const std::string& name, const std::string& pre, Date& d, bool& isZip) {
     const std::string csv = ".csv", zip = ".csv.zip";
     if (name.compare(0, pre.size(), pre) != 0) return false;
@@ -334,6 +492,139 @@ long long CsvSink::bytesOnDisk() const {
         if (!e2) total += static_cast<long long>(sz);
     }
     return total;
+}
+
+// Compress one file into <path>.zip. Factored out of archiveOldFiles so the
+// all-stream sweep uses exactly the same path: same size cap, same ZIP entry
+// shape, same failure behaviour (leave the file raw and say why).
+bool CsvSink::archiveFile(const std::string& src, const std::string& dstZip,
+                          std::string& err) {
+    std::error_code ec;
+    const auto sz = fs::file_size(src, ec);
+    if (ec) { err = "cannot size " + src; return false; }
+
+    const unsigned long long capBytes =
+        static_cast<unsigned long long>(opts_.archiveMaxMb) * 1048576ull;
+    if (sz > 0xFFFFFFFFull || (opts_.archiveMaxMb > 0 && sz > capBytes)) {
+        err = "oversized, left raw";
+        return false;
+    }
+
+    std::ifstream in(src, std::ios::binary);
+    if (!in) { err = "cannot read " + src; return false; }
+    std::vector<std::uint8_t> buf(static_cast<size_t>(sz));
+    if (sz > 0) in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(sz));
+    if (!in && sz > 0) { err = "short read"; return false; }
+    in.close();
+
+    const std::string name = fs::path(src).filename().string();
+    Date d{};
+    // The date sits at a fixed offset before the extension in every stream we
+    // write; if it will not parse, stamp the entry with today rather than fail.
+    {
+        const size_t dot = name.rfind('.');
+        if (dot != std::string::npos && dot >= 10)
+            Date::parseIso(name.substr(dot - 10, 10), d);
+    }
+
+    ZipEntry ze;
+    ze.name = name;
+    ze.data = std::move(buf);
+    ze.year = d.y ? d.y : 1980;
+    ze.month = d.m ? d.m : 1;
+    ze.day = d.d ? d.d : 1;
+
+    const std::vector<std::uint8_t> zbytes = buildZip({ze});
+    std::ofstream out(dstZip, std::ios::binary | std::ios::trunc);
+    if (!out) { err = "cannot create " + dstZip; return false; }
+    out.write(reinterpret_cast<const char*>(zbytes.data()),
+              static_cast<std::streamsize>(zbytes.size()));
+    if (!out) { err = "short write to " + dstZip; return false; }
+    out.close();
+    return true;
+}
+
+int CsvSink::maintainAllStreams(const Date& today) {
+    std::error_code ec;
+    if (!fs::exists(opts_.dir, ec)) return 0;
+
+    // Every stream the agent writes into this directory. The telemetry prefix
+    // is configurable; the other two are fixed by the code that writes them.
+    struct Stream { std::string prefix; std::string ext; };
+    const Stream streams[] = {
+        {opts_.prefix + "-",         ".csv"},
+        {"unknown-processes-",       ".csv"},
+        {"edgevitals-",              ".log"},
+    };
+
+    const long long archiveCut = opts_.archiveAfterDays > 0
+                                     ? today.serial() - opts_.archiveAfterDays
+                                     : today.serial() - 1000000;
+    const long long purgeCut = today.serial() - opts_.retentionDays;
+    const std::string todayName = fs::path(path_).filename().string();
+
+    int touched = 0;
+    for (const auto& st : streams) {
+        // Collect first, act second: archiving renames files, and mutating a
+        // directory while iterating it is undefined.
+        std::vector<fs::path> found;
+        for (const auto& e : fs::directory_iterator(opts_.dir, ec)) {
+            if (ec) break;
+            found.push_back(e.path());
+        }
+
+        for (const auto& path : found) {
+            const std::string name = path.filename().string();
+            Date d{};
+            bool isZip = false;
+            // A sidecar past retention goes even if its log is already gone:
+            // an orphan chain makes a verifier report a missing file rather
+            // than a retired one. Earlier builds left orphans behind.
+            static const std::string kChain = ".chain";
+            if (name.size() > kChain.size() &&
+                name.compare(name.size() - kChain.size(), kChain.size(), kChain) == 0) {
+                if (classifyExt(name.substr(0, name.size() - kChain.size()), st.prefix, st.ext, d, isZip) &&
+                    d.serial() < purgeCut) {
+                    std::error_code rm;
+                    if (fs::remove(path, rm)) ++touched;
+                }
+                continue;
+            }
+            if (!classifyExt(name, st.prefix, st.ext, d, isZip)) continue;
+            if (name == todayName) continue;                 // never today's own file
+            if (d.serial() >= today.serial()) continue;      // nor anything dated today
+
+            if (d.serial() < purgeCut) {
+                std::error_code rm;
+                if (fs::remove(path, rm)) {
+                    ++touched;
+                    // The sidecar retires with its log; an orphan chain makes a
+                    // verifier report a missing file rather than a retired one.
+                    // The sidecar is named after the LOG, not the archive:
+                    // x.csv.zip retires x.csv.chain, not x.csv.zip.chain.
+                    std::string base = path.string();
+                    if (isZip && base.size() > 4) base.resize(base.size() - 4);
+                    std::error_code rm2;
+                    fs::remove(base + ".chain", rm2);
+                }
+                continue;
+            }
+
+            if (!isZip && d.serial() < archiveCut) {
+                // The log is compressed; its .chain stays beside the .zip,
+                // uncompressed. To verify an archived day, extract the log
+                // next to its sidecar and run evverify. Both retire together
+                // at retention_days.
+                const std::string zipPath = path.string() + ".zip";
+                std::string aerr;
+                if (archiveFile(path.string(), zipPath, aerr)) {
+                    std::error_code rm;
+                    if (fs::remove(path, rm)) ++touched;
+                }
+            }
+        }
+    }
+    return touched;
 }
 
 }  // namespace ev

@@ -5,6 +5,7 @@
 //   edgevitals.exe --uninstall          remove it
 //   edgevitals.exe --config <path>      config file (default config/edgevitals.json)
 //   edgevitals.exe --once               one tick to stdout, then exit (smoke test)
+//   edgevitals.exe --version            print the agent version and exit
 //
 // With no arguments it assumes it was launched by the SCM. Running it from a
 // console with no arguments therefore does nothing visible, which is why
@@ -17,9 +18,12 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <memory>
 #include <thread>
 
 #include "edgevitals/Agent.h"
+#include "edgevitals/FileLogger.h"
+#include "edgevitals/SelfCheck.h"
 #include "edgevitals/Config.h"
 
 using namespace ev;
@@ -40,6 +44,14 @@ SERVICE_STATUS_HANDLE g_statusHandle = nullptr;
 
 // Defined below, but called from serviceMain which appears first.
 void securitySelfCheck(const ev::Config& cfg, ev::ILogger& log);
+
+// Defined further down but used by serviceMain, which appears first.
+std::string exePath();
+std::string exeDir();
+std::shared_ptr<ev::ILogger> attachFileLog(const ev::Config& cfg,
+                                           std::shared_ptr<ev::ILogger> inner,
+                                           std::shared_ptr<ev::FileLogger>& keep);
+void logSelfIntegrity(ev::ILogger& log);
 
 class ConsoleLogger : public ILogger {
 public:
@@ -103,7 +115,7 @@ void WINAPI serviceMain(DWORD, LPSTR*) {
     g_status.dwWin32ExitCode = NO_ERROR;
     setState(SERVICE_START_PENDING, 10000);
 
-    EventLogLogger log;
+    auto evtlog = std::make_shared<EventLogLogger>();
 
     Config cfg = Config::defaults();
     std::string err;
@@ -111,15 +123,21 @@ void WINAPI serviceMain(DWORD, LPSTR*) {
         // A missing or bad config is a warning, not a failure to start. An ATM
         // that loses telemetry because someone fat-fingered a JSON comma is
         // worse than one running on defaults and saying so.
-        log.warn("config: " + err + " -- running on defaults");
+        evtlog->warn("config: " + err + " -- running on defaults");
     }
     cfg.runNote = g_runNote;
-    securitySelfCheck(cfg, log);
+    cfg.exeDir = exeDir();
+    cfg.resolvePaths();
 
-    Agent agent(cfg, log);
+    std::shared_ptr<FileLogger> fileLog;
+    auto flog = attachFileLog(cfg, evtlog, fileLog);
+    logSelfIntegrity(*flog);
+    securitySelfCheck(cfg, *flog);
+
+    Agent agent(cfg, *flog);
     g_agent = &agent;
     if (!agent.start()) {
-        log.error("agent failed to start");
+        flog->error("agent failed to start");
         g_status.dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
         setState(SERVICE_STOPPED);
         return;
@@ -128,6 +146,9 @@ void WINAPI serviceMain(DWORD, LPSTR*) {
     setState(SERVICE_RUNNING);
     agent.run();
     g_agent = nullptr;
+    // Seal the log chain before reporting stopped, for the same reason as the
+    // console path: an unsealed file cannot be told from a truncated one.
+    if (fileLog) fileLog->close();
     setState(SERVICE_STOPPED);
 }
 
@@ -173,6 +194,13 @@ void securitySelfCheck(const ev::Config& cfg, ev::ILogger& log) {
     log.info("security: verify the exe directory grants write to Administrators "
              "and SYSTEM only, and that the binary is Authenticode signed. "
              "Neither can be checked reliably from inside the process.");
+}
+
+// Directory holding the running binary, with no trailing separator.
+std::string exeDir() {
+    const std::string p = exePath();
+    const size_t slash = p.find_last_of("\\/");
+    return slash == std::string::npos ? std::string(".") : p.substr(0, slash);
 }
 
 std::string exePath() {
@@ -288,16 +316,54 @@ BOOL WINAPI ctrlHandler(DWORD) {
     return TRUE;
 }
 
+
+// Wraps an inner logger in the day-rotated, chained file logger and records
+// what binary is running. Both paths -- service and console -- go through here
+// so the two cannot drift apart.
+std::shared_ptr<ev::ILogger> attachFileLog(const ev::Config& cfg,
+                                           std::shared_ptr<ev::ILogger> inner,
+                                           std::shared_ptr<ev::FileLogger>& keep) {
+    ev::FileLogger::Options fo;
+    fo.dir = cfg.logDir;
+    fo.prefix = "edgevitals";
+    fo.retentionDays = cfg.retentionDays;
+    fo.chainEveryLines = cfg.chainEveryLogLines;
+    keep = std::make_shared<ev::FileLogger>(fo, inner);
+    return keep;
+}
+
+// First lines of every run: which build, hashed, and whether it is signed.
+// Written through the logger so they land in the file, in its chain, and
+// -- once shipped -- at EdgeSentinel, where a hash that changes without a
+// release is visible. The process cannot verify itself; this records the fact
+// so somebody else can.
+void logSelfIntegrity(ev::ILogger& log) {
+    ev::SelfIntegrity si = ev::checkSelf(exePath());
+    ev::checkSignature(si);
+    log.info(si.summary(ev::kAgentVersion));
+    if (si.signature == ev::SelfIntegrity::Signature::Invalid)
+        log.error("self: Authenticode verification FAILED -- this binary does not "
+                  "match its signature. Investigate before trusting its output.");
+    else if (si.signature == ev::SelfIntegrity::Signature::Unsigned)
+        log.warn("self: binary is unsigned. Application control will block it on a "
+                 "hardened terminal, and its provenance rests on the hash alone.");
+}
+
 int runConsole(bool once) {
-    ConsoleLogger log;
+    auto console = std::make_shared<ConsoleLogger>();
     Config cfg = Config::defaults();
     std::string err;
-    if (!cfg.load(g_configPath, err)) log.warn("config: " + err + " -- running on defaults");
+    if (!cfg.load(g_configPath, err)) console->warn("config: " + err + " -- running on defaults");
     cfg.runNote = g_runNote;
     if (once) cfg.intervalMs = 1000;
-    securitySelfCheck(cfg, log);
+    // File logging starts AFTER the config is read, because the log directory
+    // comes from it. The few lines before this point go to the console only.
+    std::shared_ptr<FileLogger> fileLog;
+    auto flog = attachFileLog(cfg, console, fileLog);
+    logSelfIntegrity(*flog);
+    securitySelfCheck(cfg, *flog);
 
-    Agent agent(cfg, log);
+    Agent agent(cfg, *flog);
     g_agent = &agent;
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
     if (!agent.start()) return 1;
@@ -314,6 +380,10 @@ int runConsole(bool once) {
     }
     agent.run();
     g_agent = nullptr;
+    // Seal the log chain before exit. A day file that ends without a final
+    // checkpoint cannot be distinguished from one an attacker truncated, and
+    // anything appended afterwards would verify as "trailing bytes, normal".
+    if (fileLog) fileLog->close();
     return 0;
 }
 
@@ -326,6 +396,7 @@ void usage() {
         "  --uninstall          remove the service\n"
         "  --config <path>      config file (default config/edgevitals.json)\n"
         "  --note <text>        label this run in the CSV (what the terminal was doing)\n"
+        "  --version            print the agent version and exit\n"
         "  --help               this text\n\n"
         "With no arguments it expects to be started by the Service Control Manager.\n");
 }
@@ -342,6 +413,10 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--install")) install = true;
         else if (!std::strcmp(a, "--uninstall")) uninstall = true;
         else if (!std::strcmp(a, "--help") || !std::strcmp(a, "-h")) help = true;
+        else if (!std::strcmp(a, "--version")) {
+            std::printf("%s\n", ev::kAgentVersion);
+            return 0;
+        }
         else if (!std::strcmp(a, "--config") && i + 1 < argc) g_configPath = argv[++i];
         else if (!std::strcmp(a, "--note") && i + 1 < argc) g_runNote = argv[++i];
         else { std::fprintf(stderr, "unknown argument: %s\n\n", a); usage(); return 2; }

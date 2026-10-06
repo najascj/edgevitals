@@ -3,12 +3,14 @@
 #include <string>
 #include <vector>
 
+#include "edgevitals/Health.h"
+
 namespace ev {
 
 // Written into every row. A CSV read months later must be able to say which
 // build produced it -- a schema change between drops silently redefines
 // columns otherwise, and the file carries no other clue.
-constexpr const char* kAgentVersion = "0.9.1-buildfix";
+constexpr const char* kAgentVersion = "3.2.1-lifecycle";
 
 // One process EdgeVitals is asked to track by name. Role becomes the column
 // prefix, so it must be a valid identifier fragment: ui_cpu_pct, vision_rss_mb.
@@ -41,6 +43,12 @@ struct TrackedProcess {
     // Job Object CPU cap at launch, and it belongs to whatever starts these
     // processes.
     std::string tier;
+    // Handle-type probe for this role: four columns saying which KIND of
+    // handle it holds most of and which kind grew most since the last probe.
+    // Opt-in per role, like gui -- four columns on all 17 roles would be 68,
+    // nearly all permanently empty. Has no effect unless
+    // sampling.handle_probe_enabled is also true.
+    bool handleProbe = false;
 };
 
 struct Config {
@@ -50,8 +58,31 @@ struct Config {
                                     // Process churn is not a 10 s phenomenon
                                     // and enumeration is the expensive part.
 
+    // Handle-type probe. TRIGGERED, never on cadence: the snapshot is the whole
+    // machine's handle table (~2 MB, ~50k entries on the lab terminal) and
+    // cannot fit the per-tick budget. It runs when a probed role's handle count
+    // has risen by handleProbeDelta above its baseline, or once to take a
+    // baseline when a role's process set has been stable for
+    // handleProbeMinSeconds -- and never twice within handleProbeMinSeconds.
+    // On a healthy terminal that is one probe per process start, then nothing.
+    bool handleProbeEnabled = true;
+    long long handleProbeDelta = 200;
+    double handleProbeMinSeconds = 300.0;
+    // Refuse the snapshot rather than allocate past this. 6, not the 16 first
+    // proposed: the self-budget is vitals_private_mb max under 8 MB against a
+    // 1.4 MB baseline, and 16 would let the probe alone breach it.
+    int handleProbeMaxMb = 6;
+
     // ── output ──────────────────────────────────────────────────────────
+    // Relative by design, resolved against the EXE directory rather than the
+    // working directory. The SCM sets a service's CWD to system32, so a bare
+    // "logs" would otherwise put telemetry in C:\\Windows\\System32\\logs.
     std::string logDir = "logs";
+    std::string exeDir;                 // set by main before resolvePaths()
+
+    // Makes every relative path absolute against exeDir. Idempotent: an
+    // already-absolute path is left alone, so "D:\\EdgeVitals\\logs" still works.
+    void resolvePaths();
     std::string filePrefix = "telemetry";
     int retentionDays = 30;
     // Files older than this are compressed to <name>.csv.zip and the raw .csv
@@ -66,6 +97,28 @@ struct Config {
     // moment counts as contention. Percent of ONE core, matching the budgets.
     double txnActivePct = 5.0;
     double bgLimitPct = 5.0;
+
+    // How often a chain checkpoint is written, in rows for the telemetry CSV
+    // and lines for the agent log. Everything after the last checkpoint is
+    // unverified until the next one lands, so this sets how much of a LIVE
+    // file EdgeSentinel must ingest on trust -- and how much an abrupt kill
+    // leaves unchained. 30 rows at a 10 s interval is five minutes.
+    //
+    // Cost per checkpoint is one SHA-256 finalisation (microseconds) and a
+    // ~300 byte sidecar line. The CPU is free; the sidecar is NOT, and the
+    // earlier estimate of "about 430 KB over 180 days" was wrong by two orders
+    // of magnitude. Measured properly, at a 10 s interval:
+    //
+    //   30 rows -> 288 checkpoints/day,   84 KB/day,   15 MB over 180 days
+    //    6 rows -> 1,440 checkpoints/day, 422 KB/day,  74 MB over 180 days
+    //
+    // 74 MB against a ~900 MB total log footprint is roughly 8% -- worth
+    // paying to cut the unverified tail from five minutes to one, but a real
+    // trade rather than a free one.
+    //
+    // 0 disables chaining entirely, which also disables tamper evidence.
+    int chainEveryRows = 30;
+    int chainEveryLogLines = 50;
     // Stop writing below this and say so once. A telemetry log that fills the
     // disk and takes the terminal out of service is a self-inflicted outage.
     double diskFloorMb = 500.0;
@@ -111,6 +164,12 @@ struct Config {
 
     // ── tracked processes ───────────────────────────────────────────────
     std::vector<TrackedProcess> tracked;
+
+    // ── health link for EdgeBastion (3.2) ───────────────────────────────
+    // Critical-process liveness, thresholds with trend, and the pipe
+    // EdgeBastion queries. Observe and answer only: advisories are messages,
+    // never actions. See Health.h.
+    HealthConfig health;
 
     // Loads from path. On any failure returns false with err set and leaves
     // *this at defaults -- a bad config must not produce a half-applied one.
