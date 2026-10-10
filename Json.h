@@ -14,7 +14,7 @@
 
 namespace ev {
 
-class Json {
+class Json {  // NOLINT(misc-no-recursion) -- nested values copy recursively; depth bounded to 64 by the parser (EV-1)
 public:
     enum class Type { Null, Bool, Number, String, Array, Object };
 

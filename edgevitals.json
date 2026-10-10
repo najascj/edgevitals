@@ -1,12 +1,19 @@
 {
   "_comment": [
     "Process monitor: samples resource use per process, flags threshold crossings, sends critical ones to EdgeSentinel.",
+    "3.4: remote-access posture monitor (section posture, profile config/posture-profile.json).",
+    "3.5: endpoint integrity (section integrity, baseline config/integrity-baseline.json) + agent liveness beacon.",
     "Roles below are built from the exe names actually observed on the GFF rig's discovery log on 10 Sep 2026."
   ],
 
   "sampling": {
     "interval_ms": 10000,
-    "enumerate_every_ticks": 6
+    "enumerate_every_ticks": 6,
+    "_note_handle_probe": "Triggered, never on cadence: whole-machine handle snapshot when a handle_probe role rises by delta, plus one baseline per process start after min_seconds of stability. Types only, never names.",
+    "handle_probe_enabled": true,
+    "handle_probe_delta": 200,
+    "handle_probe_min_seconds": 300,
+    "handle_probe_max_mb": 6
   },
 
   "output": {
@@ -17,6 +24,9 @@
     "archive_max_mb": 64,
     "txn_active_pct": 5,
     "bg_limit_pct": 5,
+    "_note": "chain_every_rows sets how much of a LIVE file is unverified. 6 = a checkpoint a minute; costs 422 KB/day of sidecar, 74 MB over 180 d. 30 = five minutes, 15 MB.",
+    "chain_every_rows": 6,
+    "chain_every_log_lines": 25,
     "disk_floor_mb": 500,
     "flush_every_tick": true
   },
@@ -56,7 +66,7 @@
     "allow_snapshot": false,
     "_comment": [
       "Columns clients may push. Declared here because the schema freezes before the first row.",
-      "client_sid MUST be narrowed from AU to EdgeTerminal's account before production -- see SECURITY_REVIEW.md."
+      "client_sid MUST be narrowed from AU before production. NOTE: 'IU' was tried and killed IPC outright -- use the account SID from: wmic useraccount where name='ATM_USER' get sid. 3.0.6 warns at startup if the pipe fails to open."
     ],
     "extra_columns": [
       { "name": "state",              "text": true },
@@ -83,31 +93,133 @@
     ]
   },
 
+  "winevents": {
+    "_note": "3.3 Windows Event Log watcher. Records curated events into winevents-YYYY-MM-DD.jsonl (chained, same retention as the other logs): event id, source, time, level and key fields ONLY -- user names, paths, SIDs, IP and e-mail addresses are always removed. Security is OFF: enable it only with the bank's written approval. Defender and CodeIntegrity channels are optional extras.",
+    "enabled": true,
+    "backfill_hours": 24,
+    "max_per_tick": 200,
+    "rate_limits": { "per_key_per_hour": 20, "per_minute": 30, "per_day": 5000, "summary_every_s": 300 },
+    "privacy": { "max_fields": 8, "max_value_len": 128, "denied_field_words": [] },
+    "_note_channels": "forward_unlisted_max_level: also record events no rule names, at level 1 (critical) to N; 2 = critical and error. Never informational.",
+    "channels": [
+      { "name": "System", "enabled": true, "forward_unlisted_max_level": 2 },
+      { "name": "Application", "enabled": true, "forward_unlisted_max_level": 2 },
+      { "name": "Security", "enabled": false, "forward_unlisted_max_level": 0 },
+      { "name": "Microsoft-Windows-Windows Defender/Operational", "enabled": false, "forward_unlisted_max_level": 0 },
+      { "name": "Microsoft-Windows-CodeIntegrity/Operational", "enabled": false, "forward_unlisted_max_level": 0 }
+    ],
+    "rules": [
+      { "name": "unexpected_restart", "channel": "System", "provider": "Microsoft-Windows-Kernel-Power", "ids": [41], "severity": "critical" },
+      { "name": "bugcheck", "channel": "System", "provider": "BugCheck", "ids": [1001], "severity": "critical" },
+      { "name": "unexpected_shutdown", "channel": "System", "provider": "EventLog", "ids": [6008], "severity": "critical" },
+      { "name": "os_start_stop", "channel": "System", "provider": "Microsoft-Windows-Kernel-General", "ids": [12, 13], "severity": "info" },
+      { "name": "clock_changed", "channel": "System", "provider": "Microsoft-Windows-Kernel-General", "ids": [1], "severity": "warning" },
+      { "name": "log_cleared", "channel": "System", "provider": "Microsoft-Windows-Eventlog", "ids": [104], "severity": "critical" },
+      { "name": "service_crashed", "channel": "System", "provider": "Service Control Manager", "ids": [7031, 7034], "severity": "error" },
+      { "name": "service_failed_start", "channel": "System", "provider": "Service Control Manager", "ids": [7000, 7009, 7023], "severity": "error" },
+      { "name": "service_installed", "channel": "System", "provider": "Service Control Manager", "ids": [7045], "severity": "warning" },
+      { "name": "disk_error", "channel": "System", "provider": "disk", "ids": [7, 11, 51, 153], "severity": "error" },
+      { "name": "filesystem_corrupt", "channel": "System", "provider": "Ntfs", "ids": [55], "severity": "critical" },
+      { "name": "hardware_error", "channel": "System", "provider": "Microsoft-Windows-WHEA-Logger", "ids": [17, 18, 19, 47], "severity": "critical" },
+      { "name": "low_memory", "channel": "System", "provider": "Microsoft-Windows-Resource-Exhaustion-Detector", "ids": [2004], "severity": "critical" },
+      { "name": "shadow_copies_removed", "channel": "System", "provider": "volsnap", "ids": [25, 36], "severity": "warning" },
+      { "name": "driver_load_failed", "channel": "System", "provider": "Microsoft-Windows-Kernel-PnP", "ids": [219], "severity": "warning" },
+      { "name": "removable_media", "channel": "System", "provider": "Microsoft-Windows-Kernel-PnP", "ids": [400, 410], "severity": "warning" },
+      { "name": "usb_device", "channel": "System", "provider": "Microsoft-Windows-DriverFrameworks-UserMode", "ids": [2003, 2100, 2102], "severity": "warning" },
+      { "name": "app_crash", "channel": "Application", "provider": "Application Error", "ids": [1000], "severity": "error" },
+      { "name": "app_hang", "channel": "Application", "provider": "Application Hang", "ids": [1002], "severity": "error" },
+      { "name": "security_log_cleared", "channel": "Security", "provider": "Microsoft-Windows-Eventlog", "ids": [1102], "severity": "critical" },
+      { "name": "logon_failed", "channel": "Security", "provider": "Microsoft-Windows-Security-Auditing", "ids": [4625], "severity": "warning" },
+      { "name": "account_changed", "channel": "Security", "provider": "Microsoft-Windows-Security-Auditing", "ids": [4720, 4722, 4724, 4732, 4740], "severity": "warning" },
+      { "name": "service_installed_audit", "channel": "Security", "provider": "Microsoft-Windows-Security-Auditing", "ids": [4697], "severity": "warning" },
+      { "name": "time_changed_audit", "channel": "Security", "provider": "Microsoft-Windows-Security-Auditing", "ids": [4616], "severity": "warning" },
+      { "name": "malware_detected", "channel": "Microsoft-Windows-Windows Defender/Operational", "provider": "Microsoft-Windows-Windows Defender", "ids": [1116, 1117], "severity": "critical" },
+      { "name": "realtime_protection_off", "channel": "Microsoft-Windows-Windows Defender/Operational", "provider": "Microsoft-Windows-Windows Defender", "ids": [5001], "severity": "critical" },
+      { "name": "code_integrity_block", "channel": "Microsoft-Windows-CodeIntegrity/Operational", "provider": "Microsoft-Windows-CodeIntegrity", "ids": [3033, 3077], "severity": "warning" }
+    ]
+  },
+
+  "posture": {
+    "_note": "3.4 remote-access posture (RA-001..RA-020), the same check IDs and profile file as ATMProbe. Observe-only: it reports, it never switches anything off. Full run at start (session baseline), every interval_minutes, within 5 s of a watched service changing (SCM 7036/7040 via winevents), and when the TCP listener set changes (listener_poll_seconds). Output: logs/posture-YYYY-MM-DD.jsonl (chained, same retention), CSV posture_fail / posture_flags, and 'event:' lines in the agent log for EdgeSentinel.",
+    "enabled": true,
+    "interval_minutes": 15,
+    "listener_poll_seconds": 60,
+    "on_service_change": true,
+    "max_events_per_hour": 12,
+    "profile": "config/posture-profile.json",
+    "_note_rdp": "rdp_session_events needs the bank to allow the TerminalServices LocalSessionManager and RemoteConnectionManager Operational channels. rdp_session_source_ip records the RDP client address in the posture file ONLY -- off by default because the 3.3 privacy rule keeps IP addresses out of every record; turn it on only with the bank's written approval.",
+    "rdp_session_events": false,
+    "rdp_session_source_ip": false,
+    "watched_services": []
+  },
+
+  "integrity": {
+    "_note": "3.5 endpoint integrity: File-Integrity Monitoring over the watched fileset in config/integrity-baseline.json, plus a persistence watch (autostart / services / scheduled tasks). Observe-only: it reports a change, it never restores a file or removes an autostart. Output: logs/integrity-YYYY-MM-DD.jsonl (chained), CSV integrity_fail / integrity_flags, and 'event:' lines for EdgeSentinel.",
+    "enabled": true,
+    "interval_minutes": 60,
+    "max_events_per_hour": 12,
+    "max_files": 256,
+    "max_file_mb": 64,
+    "baseline": "config/integrity-baseline.json",
+    "_note_liveness": "Agent liveness beacon: a monotonic liveness_beat number written to every CSV row and an agent-log line every liveness_beacon_s. A gap in the series means EdgeVitals was down (killed to go dark). 0 disables it.",
+    "liveness_beacon_s": 300
+  },
+
+  "health": {
+    "_note": "3.2 health link for EdgeBastion. EdgeVitals observes and answers; EdgeBastion decides and acts. Separate pipe from ipc.pipe: different audience, different ACL. EdgeTerminal heartbeat = {\"hb\":1,\"role\":\"ui\"} every 5 s on the EXISTING metrics pipe. In service mode the window check is always unknown (Session 0 cannot see the desktop), so the heartbeat is the hang signal.",
+    "enabled": true,
+    "pipe": "\\\\.\\pipe\\edgevitals-health",
+    "allowed_accounts": ["NT SERVICE\\EdgeBastion"],
+    "max_clients": 4,
+    "advisory_min_interval_s": 60,
+    "startup_grace_s": 180,
+    "watch_max_pids": 32,
+    "system": { "commit_pct_max": 90, "disk_free_mb_min": 2048, "disk_shrink_mb_per_hour": 100 },
+    "_note_defaults": "Brief defaults (6 Oct 2026). ceiling_mb 0 = use the role's ram_budget_mb; set it from a measured p99 before field use, or 80% of the budget will warn on a healthy EdgeTerminal. cpu_stall_hang stays false: idle SPs legitimately accrue no CPU.",
+    "defaults": {
+      "ceiling_mb": 0, "ceiling_pct": 80,
+      "handles_max": 10000, "handle_growth_pct_per_hour": 5,
+      "gdi_max": 8000, "gdi_growth_per_hour": 50,
+      "faults_per_sec_max": 20000, "faults_hold_s": 60,
+      "cpu_pct_max": 90, "cpu_hold_s": 300,
+      "leak_window_s": 1800, "leak_min_span_s": 600, "leak_min_mb_per_hour": 20, "leak_min_growth_mb": 10,
+      "hang_hold_s": 30, "hang_min_samples": 3, "absent_min_samples": 2, "threshold_min_samples": 3,
+      "heartbeat_max_age_s": 10, "cpu_stall_hang": false
+    },
+    "critical": [
+      { "role": "ui",      "process": "EdgeTerminal.exe", "heartbeat_role": "ui" },
+      { "role": "xfs" },
+      { "role": "broker" },
+      { "role": "nats" },
+      { "role": "bastion", "process": "EdgeBastion.exe" }
+    ]
+  },
+
   "processes": [
     { "role": "ui",       "label": "EdgeTerminal", "tier": "transaction", "group": "bosach",
-      "_note": "10 Sep: 673 MB p50, peak 1430, +548 handles over 7 h, three restarts.",
+      "_note": "17-24 Sep, four sessions: private 1313-1382 p50 but RESIDENT only 293-333. Budget tracks the resident set; the commit gap is the in-process Vosk model.",
       "exe": ["EdgeTerminalDemo.exe", "EdgeTerminal.exe"],
-      "ram_budget_mb": 260,  "cpu_budget_pct": 20, "gui": true },
+      "ram_budget_mb": 400,  "cpu_budget_pct": 20, "gui": true, "handle_probe": true },
 
-    { "role": "vision",   "label": "EdgeSignal-Vision", "tier": "background", "group": "bosach",
-      "_note": "ESV runs as plain python.exe on this rig -- see the warning in the notes.",
+    { "role": "vision",   "label": "EdgeSignal-Vision", "tier": "transaction", "group": "bosach",
+      "_note": "tier=transaction: face_cover GATES the UI, so ESV can halt a transaction. Measured 435 MB / 29.5% core / 5370 cpu-sec, four sessions. Matches plain python.exe on this rig. CAUTION: python.exe, python3.11.exe and pythonw.exe match ANY Python process on the terminal, and all of them are summed into vision. Ship ESV under its own exe name (edgesignal-vision.exe), then delete the three python entries.",
       "exe": ["edgesignal-vision.exe", "EdgeSignalVision.exe", "python.exe", "python3.11.exe", "pythonw.exe"],
-      "ram_budget_mb": 220,  "cpu_budget_pct": 60 },
+      "ram_budget_mb": 450,  "cpu_budget_pct": 45 },
 
     { "role": "vosk",     "label": "Vosk ASR (in-process today)", "tier": "interactive", "group": "bosach",
-      "_note": "Never binds -- ASR runs inside EdgeTerminal, so its cost sits inside ui_.",
-      "exe": ["vosk-server.exe"],
+      "_note": "Never binds yet: ASR is in-process, and the ~1050 MB commit gap in ui_ is its model. Re-baseline once split out.",
+      "exe": ["vosk-server.exe", "vosk.exe", "edgevoice.exe"],
       "ram_budget_mb": 130,  "cpu_budget_pct": 30 },
 
     { "role": "piper",    "label": "Piper TTS", "tier": "interactive", "group": "bosach",
-      "_note": "90-200% of one core for 1-2 s per utterance by design.",
+      "_note": "Measured (n=2): 168 MB p50, 191 max, 0.00% CPU when caught. Short-lived; a 1 s run is needed to characterise it.",
       "exe": ["piper.exe"],
-      "ram_budget_mb": 150,  "cpu_budget_pct": 100 },
+      "ram_budget_mb": 220,  "cpu_budget_pct": 100 },
 
     { "role": "rhubarb",  "label": "Rhubarb lip-sync", "tier": "interactive", "group": "bosach",
-      "_note": "Short-lived per utterance; sampled only when a 10 s tick lands on it.",
+      "_note": "Over the old 60 MB on every sighting: 63/148/155/208 MB across four days. Caught ~7% of runs at 10 s sampling.",
       "exe": ["rhubarb.exe"],
-      "ram_budget_mb": 60,   "cpu_budget_pct": 100 },
+      "ram_budget_mb": 200,  "cpu_budget_pct": 100 },
 
     { "role": "content",  "label": "EdgeSignal-Content", "tier": "background", "group": "bosach",
       "_note": "Idle most of the time; spikes during patch or content delivery.",
@@ -140,12 +252,22 @@
       "ram_budget_mb": 15,   "cpu_budget_pct": 1 },
 
     { "role": "broker",   "label": "EdgeXfsBroker", "tier": "transaction", "group": "bosach",
-      "_note": "Untracked until 12 Sep. Sits on the dispense path and writes the evidence journal.",
+      "_note": "Measured 3.5-3.7 MB, 0.00% CPU, four sessions. Handles moved -8/+99/+126 -- watch, do not act. On the dispense path.",
       "exe": ["edgexfsbroker.exe"],
-      "ram_budget_mb": 80,   "cpu_budget_pct": 20 },
+      "ram_budget_mb": 10,   "cpu_budget_pct": 5 },
+
+    { "role": "voize",    "label": "VoizeTTS server", "tier": "interactive", "group": "bosach",
+      "_note": "Added Oct 2026. Replaces Piper for EdgeTerminal prompts; loopback-only server. CONFIRM the exe name on a terminal (tasklist /fo csv) and keep only the real one(s): a name that matches nothing leaves voize_* empty, never an error. Budgets 0 (none) until a baseline session is measured. Keep the piper role until Piper is gone from every terminal.",
+      "exe": ["voizetts.exe", "voizetts-server.exe", "btsynth.exe", "ttsngopus.exe"],
+      "ram_budget_mb": 0,    "cpu_budget_pct": 0 },
+
+    { "role": "transbridge", "label": "TransBridge (UPI QR cardless)", "tier": "transaction", "group": "bosach",
+      "_note": "Added Oct 2026. CONFIRM the exe name. If TransBridge runs inside EdgeTerminal rather than as its own process, delete this role: its cells would stay empty forever and only add columns. Budgets 0 until measured.",
+      "exe": ["transbridge.exe"],
+      "ram_budget_mb": 0,    "cpu_budget_pct": 0 },
 
     { "role": "xfs",      "label": "Vendor XFS / device runtime (Perto)", "tier": "transaction", "group": "environment",
-      "_note": "Six managers under C:\\Perto\\Managers; row is the SUM, xfs_pid shows only the first.",
+      "_note": "Six managers under C:\\Perto\\Managers; row is the SUM, xfs_pid shows only the first. Handle climb tracks EdgeTerminal RECONNECTS (+10 with no restarts, +188/+352/+404 with them), not probe runs.",
       "exe": [
         "pertocdmspimanager.exe",
         "pertoidcspimanager.exe",

@@ -1,0 +1,28 @@
+{
+  "_comment": [
+    "EdgeVitals 3.5 endpoint-integrity baseline: what the bank approved on a known-good terminal.",
+    "Its SHA-256 is written into every integrity baseline record (baseline_hash), so a quiet edit is visible.",
+    "Generate on a clean terminal: edgevitals.exe --fim-baseline > integrity-baseline.json, then review and commit.",
+    "A missing or rejected file falls back to the strict built-in default (nothing approved), so findings can only get louder."
+  ],
+  "profile": "default",
+
+  "_note_files": "Watched files. A bare string = watch and report changes once a hash is pinned; an object {path, sha256, required} pins the approved hash. sha256 empty = report INFO (watched, not pinned) until pinned. required false = absence is INFO not FAIL. Paths are examples; set the real install paths and pin the hashes from the clean build.",
+  "files": [
+    { "path": "C:/EdgeTerminal/EdgeTerminal.exe", "sha256": "", "required": true },
+    { "path": "C:/EdgeTerminal/EdgeXfsBroker.exe", "sha256": "", "required": true },
+    { "path": "C:/EdgeVitals/edgevitals.exe", "sha256": "", "required": true },
+    { "path": "C:/EdgeVitals/config/edgevitals.json", "sha256": "", "required": true },
+    { "path": "C:/EdgeVitals/config/posture-profile.json", "sha256": "", "required": false },
+    { "path": "C:/EdgeVitals/config/integrity-baseline.json", "sha256": "", "required": false }
+  ],
+
+  "_note_persist": "Approved persistence (autostart, services, tasks). Tokens are kind:name (any target) or kind:name:target; a trailing * is a prefix. kind is run | run_once | service | task. target is the exe file name only. Generate from the clean terminal and keep only what the bank authorises.",
+  "strict_persistence": true,
+  "persist_allow": [
+    "service:edgevitals",
+    "service:edgexfsbroker:edgexfsbroker.exe",
+    "run:edgeterminal",
+    "task:edgevitals-*"
+  ]
+}

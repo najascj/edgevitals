@@ -16,6 +16,7 @@
 // licensed and neither may become a dependency of the other.
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <string>
@@ -54,6 +55,12 @@ public:
 
     int clientCount() const { return clients_.load(); }
 
+    // True once the listener has actually created the pipe. start() only
+    // spawns the thread, so logging "IPC listening" on its return asserted
+    // something unverified -- three overlapping runs all claimed the same
+    // pipe, which cannot be true with FILE_FLAG_FIRST_PIPE_INSTANCE.
+    bool listening() const { return listening_.load(); }
+
     // Must be called before start(). Defaults are the permissive ones, so a
     // caller that forgets this gets a working but wide-open pipe -- which is
     // why Agent sets it unconditionally rather than only when configured.
@@ -75,6 +82,7 @@ private:
     std::thread listener_;
     std::atomic<bool> running_{false};
     std::atomic<int> clients_{0};
+    std::atomic<bool> listening_{false};
     std::string clientSid_ = "AU";   // SDDL form, from config
     int maxClients_ = 4;
     bool allowSnapshot_ = false;
@@ -83,6 +91,17 @@ private:
     std::mutex mu_;
     std::map<std::string, Value> pending_;
     std::string snapshot_;
+    std::map<std::string, std::chrono::steady_clock::time_point> hb_;
+
+public:
+    // Last heartbeat per role. A client sends {"hb":1,"role":"ui"} on the
+    // connection it already holds; no second channel. Read by the agent tick.
+    std::map<std::string, std::chrono::steady_clock::time_point> heartbeats() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return hb_;
+    }
+
+private:
 };
 
 }  // namespace ev

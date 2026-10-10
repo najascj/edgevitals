@@ -6,15 +6,39 @@
 namespace ev {
 
 std::string csvEscape(const std::string& v) {
+    // Formula injection. RFC 4180 quoting alone is not enough: Excel and Calc
+    // evaluate any cell whose first character is = + - @ or a lone tab/CR,
+    // regardless of quoting. Process names come from the machine and a Windows
+    // filename may legally contain '='. An attacker who can start a process
+    // named =cmd|' /c calc'!A1 gets it written verbatim into
+    // unknown-processes.csv -- a file a lab engineer is told to open in Excel.
+    // That is code execution on the analyst's workstation, reached from the
+    // ATM, and it is the one finding here that crosses machines.
+    //
+    // A leading apostrophe forces text. It is visible in the cell and changes
+    // the stored byte, which is the accepted trade: a telemetry value that
+    // reads with a stray quote beats a spreadsheet that runs a command.
+    std::string safe;
+    if (!v.empty()) {
+        const char c0 = v[0];
+        if (c0 == '=' || c0 == '+' || c0 == '-' || c0 == '@' ||
+            c0 == '\t' || c0 == '\r') {
+            safe.reserve(v.size() + 1);
+            safe.push_back('\'');
+            safe += v;
+        }
+    }
+    const std::string& in = safe.empty() ? v : safe;
+
     bool needs = false;
-    for (char c : v) {
+    for (char c : in) {
         if (c == ',' || c == '"' || c == '\n' || c == '\r') { needs = true; break; }
     }
-    if (!needs) return v;
+    if (!needs) return in;
     std::string out;
-    out.reserve(v.size() + 8);
+    out.reserve(in.size() + 8);
     out.push_back('"');
-    for (char c : v) {
+    for (char c : in) {
         if (c == '"') out.push_back('"');
         out.push_back(c);
     }
@@ -33,8 +57,14 @@ std::string Cell::toCsv(int precision) const {
             // spreadsheet reading "nan" produces a text column and silently
             // breaks every formula below it.
             if (!std::isfinite(num_)) return std::string();
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.*f", precision, num_);
+            char buf[64];  // flawfinder: ignore -- written only by snprintf(buf, sizeof(buf), ...)
+            const int n = std::snprintf(buf, sizeof(buf), "%.*f", precision, num_);
+            // Too large for fixed notation in 64 bytes: exponent form, returned
+            // as is. A silently truncated fixed number would be a wrong value.
+            if (n < 0 || n >= static_cast<int>(sizeof(buf))) {
+                (void)std::snprintf(buf, sizeof(buf), "%.*e", precision, num_);
+                return std::string(buf);
+            }
             std::string s(buf);
             // Trim a pointless fractional tail: 12.00 -> 12, 12.50 -> 12.5
             if (s.find('.') != std::string::npos) {

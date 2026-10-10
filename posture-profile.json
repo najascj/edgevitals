@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Remote-access posture profile: the SAME FILE ATMProbe reads. EdgeVitals 3.4 and ATMProbe judge RA-001..RA-020 against it.",
+    "Its SHA-256 is written into every posture baseline record (profile_hash), so a quiet edit to this file is itself visible.",
+    "A missing or rejected file means the built-in default, which is the strict one: RDP deny, no listeners beyond the Windows RPC core.",
+    "Check the first baseline from a lab terminal (edgevitals.exe --posture) before rollout, and adjust listener_allow here, not in code."
+  ],
+  "profile": "default",
+
+  "_note_rdp": "deny = RDP enabled is a FAIL. allow_hardened = RDP may be on, but only with NLA, TLS and High encryption (RA-004).",
+  "rdp": "deny",
+
+  "_note_ipc": "IPC$ exists whenever the Server service runs. false = WARN while it does; true = PASS. Disk shares (C$, ADMIN$, any other) are always a FAIL.",
+  "allow_ipc_share": false,
+
+  "_note_firewall": "true when a vendor firewall replaces Windows Firewall: RA-017 'firewall off' becomes INFO.",
+  "third_party_firewall": false,
+
+  "_note_powershell": "info = report only; restrict = WARN if the execution policy is Unrestricted or Bypass; deny = FAIL if powershell.exe is present.",
+  "powershell": "info",
+
+  "snmp": "deny",
+
+  "_note_tools": "Remote-control tools the bank authorises (by catalogue name, e.g. \"teamviewer\"): reported as INFO, not FAIL. remote_tools adds a vendor tool to the catalogue; built-in entries cannot be removed, only allowed.",
+  "remote_tools_allow": [],
+  "remote_tools": [],
+
+  "_note_listeners": "Every non-loopback listener not matched here is a RA-020 FAIL. proto tcp|udp; addr exact, \"*\" (any), \"loopback\" or \"any\" (0.0.0.0 / ::); port or port_range [lo, hi]; process and service lower-case, trailing * = prefix. A port range on every address must name a process or service.",
+  "listener_allow": [
+    { "proto": "tcp", "addr": "127.0.0.1", "port": 8787, "note": "EdgeSignal-Vision (ESV), loopback only" },
+    { "proto": "tcp", "addr": "*", "port": 135, "process": "svchost.exe", "service": "rpcss", "note": "RPC endpoint mapper (Windows)" },
+    { "proto": "tcp", "addr": "*", "port_range": [49152, 65535], "process": "wininit.exe", "note": "RPC dynamic endpoint (Windows)" },
+    { "proto": "tcp", "addr": "*", "port_range": [49152, 65535], "process": "lsass.exe", "note": "RPC dynamic endpoint (Windows)" },
+    { "proto": "tcp", "addr": "*", "port_range": [49152, 65535], "process": "services.exe", "note": "RPC dynamic endpoint (Windows)" },
+    { "proto": "tcp", "addr": "*", "port_range": [49152, 65535], "process": "spoolsv.exe", "note": "RPC dynamic endpoint (Windows)" },
+    { "proto": "tcp", "addr": "*", "port_range": [49152, 65535], "process": "svchost.exe", "service": "eventlog", "note": "RPC dynamic endpoint (Windows)" },
+    { "proto": "tcp", "addr": "*", "port_range": [49152, 65535], "process": "svchost.exe", "service": "schedule", "note": "RPC dynamic endpoint (Windows)" },
+    { "proto": "udp", "addr": "*", "port": 123, "process": "svchost.exe", "service": "w32time", "note": "Windows Time (NTP)" }
+  ]
+}
